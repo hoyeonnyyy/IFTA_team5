@@ -5,17 +5,17 @@ title: "[Feature] <short summary>"
 labels: ["enhancement"]
 ---
 
-### 💡 Summary
+### Summary
 Briefly describe the new feature or improvement.
 
-### 🎯 Motivation
+### Motivation
 Why is this needed? What problem does it solve?
 
-### 🧠 Implementation Idea
+### Implementation Idea
 How could it be implemented? (Optional)
 
-### 🔗 Related Branch / Module
+### Related Branch / Module
 (e.g., feature/ai2, feature/ui)
 
-### 👤 Assigned To
+### Assigned To
 @username
