@@ -12,6 +12,8 @@ Recorded/
 AircraftDB/*.csv
 AircraftDB/*.zip
 ARTCC_Boundary_Data/*.csv
+BigQuery/*.csv
+
 
 # Secrets / credentials (never commit)
 BigQuery/YourJsonFile.json
