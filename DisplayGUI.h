@@ -236,6 +236,7 @@ __published:	// IDE-managed Components
           Variant StreamPosition, SpeechRecognitionType RecognitionType,
           ISpeechRecoResult *Result);
 	void __fastcall LIstenClick(TObject *Sender);
+    void __fastcall NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
 
 private:	// User declarations
 
@@ -257,6 +258,8 @@ public:		// User declarations
     void __fastcall CloseBigQueryCSV(void);
     bool __fastcall LoadARTCCBoundaries(AnsiString FileName);
 
+    TLabel                     *PhaseLabel;
+    TNetHTTPClient             *NetHTTPClientPrediction;
     ISpeechRecoGrammar         *SRGrammar;
 	int                        MouseDownX,MouseDownY;
 	bool                       MouseDown;

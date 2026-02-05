@@ -234,6 +234,19 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  InitAircraftDB(AircraftDBPathFileName);
  Form1->SpVoice1->Rate=2; // Set Rate of Voice
  Form1->SpVoice1->Volume=100;  //Set Volume of Voice
+ 
+ NetHTTPClientPrediction= new TNetHTTPClient(this);
+ NetHTTPClientPrediction->OnRequestCompleted=NetHTTPClientPredictionRequestCompleted;
+
+ PhaseLabel= new TLabel(Panel4);
+ PhaseLabel->Parent=Panel4;
+ PhaseLabel->Left=15;
+ PhaseLabel->Top=320;
+ PhaseLabel->Caption="Phase: N/A";
+ PhaseLabel->Font->Color=clLime;
+ PhaseLabel->Font->Size=12;
+ PhaseLabel->Font->Style = TFontStyles() << fsBold;
+
  printf("init complete\n");
 }
 //---------------------------------------------------------------------------
@@ -786,6 +799,17 @@ return Str.WideChar(str, Str.WideCharBufSize());
 		 printf("%s\n\n",GetAircraftDBInfo(ADS_B_Aircraft->ICAO));
          Form1->SpVoice1->Speak(wtext, SpeechVoiceSpeakFlags::SVSFlagsAsync );  // Say Text and continue
          delete wtext;
+         
+         // Call Prediction API
+         try{
+           AnsiString Url="http://localhost:8001/predict/"+(AnsiString)ADS_B_Aircraft->HexAddr;
+           NetHTTPClientPrediction->Get(Url);
+           PhaseLabel->Caption="Phase: Loading...";
+         }
+         catch(...)
+         {
+             PhaseLabel->Caption="Phase: Error";
+         }
 		}
 		else
 		{
@@ -2070,4 +2094,38 @@ void __fastcall TForm1::LIstenClick(TObject *Sender)
 	SRGrammar->DictationSetState(SpeechRuleState::SGDSActive);
 }
 //---------------------------------------------------------------------------
-
+void __fastcall TForm1::NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse)
+{
+    if (AResponse->StatusCode == 200)
+    {
+        AnsiString JsonStr = AResponse->ContentAsString(TEncoding::ASCII);
+        
+        // Simple string parsing to extract phase
+        // JSON format: {"icao":"...", "phase":"CLIMB", ...}
+        char *ptr = stristr(JsonStr.c_str(), "\"phase\":");
+        if (ptr)
+        {
+            ptr += 8; // Skip "phase":
+            while (*ptr == ' ' || *ptr == '"') ptr++; // Skip spaces and quote
+            
+            char phase[64];
+            int i = 0;
+            while (*ptr != '"' && *ptr != ',' && *ptr != '}' && i < 63)
+            {
+                phase[i++] = *ptr++;
+            }
+            phase[i] = '\0';
+            
+            PhaseLabel->Caption = "Phase: " + (AnsiString)phase;
+        }
+        else
+        {
+            PhaseLabel->Caption = "Phase: Unknown Format";
+        }
+    }
+    else
+    {
+        PhaseLabel->Caption = "Phase: API Error " + IntToStr(AResponse->StatusCode);
+    }
+}
+//---------------------------------------------------------------------------

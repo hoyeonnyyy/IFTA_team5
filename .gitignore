@@ -1,5 +1,8 @@
 # Keep the repo source-only (ignore generated outputs + large data caches)
 
+__pycache__/
+BigQueryCred.json
+
 # Large caches / map tiles / recordings
 GoogleMap/
 VFR_Map/
