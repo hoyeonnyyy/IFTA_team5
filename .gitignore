@@ -8,13 +8,15 @@ GoogleMap/
 VFR_Map/
 IFR_Low_Map/
 IFR_High_Map/
-Map/
+# Map/
 Recorded/
 
 # Large datasets (keep out of git; store/download separately)
 AircraftDB/*.csv
 AircraftDB/*.zip
 ARTCC_Boundary_Data/*.csv
+BigQuery/*.csv
+
 
 # Secrets / credentials (never commit)
 BigQuery/YourJsonFile.json
