@@ -13,6 +13,9 @@ AircraftDB/*.csv
 AircraftDB/*.zip
 ARTCC_Boundary_Data/*.csv
 
+# Secrets / credentials (never commit)
+BigQuery/YourJsonFile.json
+
 # 3rd-party archives / docs that bloat the repo
 Components/**/*.zip
 HashTable/html/
