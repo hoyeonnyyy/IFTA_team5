@@ -54,15 +54,17 @@ def test_health_check(mock_model_scaler, mock_bigquery):
 def test_predict_mock_data(mock_bigquery):
     """Test prediction with mocked BigQuery data."""
     
-    # 1. Setup Mock BigQuery Result
-    mock_row = MagicMock()
-    mock_row.Altitude = 35000
-    mock_row.GroundSpeed = 450
-    mock_row.VerticalRate = 0
-    mock_row.Track = 90
+    # 1. Setup Mock BigQuery Result (DataFrame)
+    mock_df = pd.DataFrame({
+        'Altitude': [35000]*30,
+        'GroundSpeed': [450]*30,
+        'VerticalRate': [0]*30,
+        'Track': [90]*30,
+        'Time_MSG_Generated': pd.date_range(start='2024-01-01', periods=30, freq='s')
+    })
     
     mock_query_job = MagicMock()
-    mock_query_job.result.return_value = [mock_row] # Return list with one row
+    mock_query_job.to_dataframe.return_value = mock_df # Return Mock DataFrame
     
     # Apply the mock to the client instance inside main
     with patch("main.bq_client") as mock_bq_client:
@@ -70,9 +72,10 @@ def test_predict_mock_data(mock_bigquery):
         
         # 2. Setup Mock Model/Scaler (We need them to be present in main)
         mock_model = MagicMock()
-        mock_model.predict.return_value = ["CRUISE"]
+        mock_model.predict.return_value = [1] # Return integer (mapped to Cruise)
         mock_scaler = MagicMock()
-        mock_scaler.transform.return_value = [[1, 2, 3, 4]]
+        # Scaler expects (30, 4) input
+        mock_scaler.transform.return_value = np.random.rand(30, 4)
 
         with patch("main.model", mock_model), patch("main.scaler", mock_scaler):
             
@@ -83,14 +86,16 @@ def test_predict_mock_data(mock_bigquery):
             assert response.status_code == 200
             data = response.json()
             assert data["icao"] == "AABBCC"
-            assert data["phase"] == "CRUISE"
-            assert data["features"]["Altitude"] == 35000
+            assert data["phase"] == "Cruise" # 1 maps to Cruise
+            # The features list should now contain the rows from the DataFrame
+            assert len(data["features"]) == 30 
+            assert data["features"][0]["Altitude"] == 35000
 
 def test_predict_no_data(mock_bigquery):
     """Test prediction when BigQuery returns no data."""
     
     mock_query_job = MagicMock()
-    mock_query_job.result.return_value = [] # Empty list
+    mock_query_job.to_dataframe.return_value = pd.DataFrame() # Empty DataFrame
     
     with patch("main.bq_client") as mock_bq_client:
         mock_bq_client.query.return_value = mock_query_job
@@ -101,15 +106,15 @@ def test_predict_no_data(mock_bigquery):
             assert "No data found" in response.json()["detail"]
 
 # --- Integration Test (Optional - requires real credentials) ---
-@pytest.mark.skipif(not os.path.exists(os.path.join(os.path.dirname(__file__), "..", "BigQueryCred.json")), reason="No credentials file")
+@pytest.mark.skipif(not os.path.exists(os.path.join(os.path.dirname(__file__), "..", "..", "BigQuery", "YourJsonFile.json")), reason="No credentials file")
 def test_integration_bigquery_connection():
     """
     Real connection test. 
-    WARNING: This will fail if 'BigQueryCred.json' is not valid or network is down.
+    WARNING: This will fail if 'YourJsonFile.json' is not valid or network is down.
     """
     from google.cloud import bigquery
     
-    cred_path = os.path.join(os.path.dirname(__file__), "..", "BigQueryCred.json")
+    cred_path = os.path.join(os.path.dirname(__file__), "..", "..", "BigQuery", "YourJsonFile.json")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
     
     try:

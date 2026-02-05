@@ -23,8 +23,8 @@ bq_client = None
 PROJECT_ID = "iitp-class-team-5-473114"
 DATASET_ID = "Dataset"
 TABLE_ID = "FirstRun"  # Or "FirstRun_merged_filtered_added" depending on your live data source
-# Assumes BigQueryCred.json is in the same directory as main.py (based on previous conversations)
-CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "BigQueryCred.json") 
+# Assumes BigQueryCred.json is in the BigQuery directory relative to pybackend
+CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "..", "BigQuery", "YourJsonFile.json") 
 
 SEQUENCE_LENGTH = 30 # Time steps required by the model
 FEATURE_COLUMNS = ['Altitude', 'GroundSpeed', 'VerticalRate', 'Track']
