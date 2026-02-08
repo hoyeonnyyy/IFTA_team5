@@ -5,14 +5,69 @@ import numpy as np
 from fastapi import FastAPI, HTTPException
 from google.cloud import bigquery
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import math
+
+import open_meteo_client
+import weather_overlay
 
 class PredictionResponse(BaseModel):
     icao: str
     phase: str
     features: List[Dict[str, Any]] # Changed to return list of features used
     confidence: Optional[float] = None
+
+
+class TrajectoryPoint(BaseModel):
+    lat: float
+    lon: float
+    t: Optional[datetime] = None
+
+
+class WeatherOverlayRequest(BaseModel):
+    trajectory: List[TrajectoryPoint]
+    hourly: List[str] = ["surface_pressure"]
+    forecast_days: int = 1
+    cell_deg: float = 0.01
+    # If True, inserts intermediate points between trajectory points so intermediate cells are included.
+    # Default is False to return only the cells corresponding to the provided points.
+    densify: bool = False
+    radius_cells: int = 0  # expand around the trajectory for a heatmap-like look
+    target_time: Optional[datetime] = None  # UTC recommended
+    time_mode: Literal["nearest", "floor", "ceil"] = "nearest"
+    include_series: bool = False  # if True, also return the full hourly series per cell
+    # Controls what lat/lon in the response represents.
+    # - input_point: return the original input lat/lon (best for frontend), and include cell_lat/cell_lon for grid overlay.
+    # - cell_center: return the quantized cell center as lat/lon (legacy behavior), input_lat/input_lon still provided when available.
+    coord_mode: Literal["input_point", "cell_center"] = "input_point"
+
+
+class WeatherCell(BaseModel):
+    lat: float
+    lon: float
+    # If available, the original trajectory point that produced this cell (only reliable when densify=False and radius_cells=0).
+    input_lat: Optional[float] = None
+    input_lon: Optional[float] = None
+    # Quantized cell center coordinates (useful for heatmap grid rendering even when lat/lon are input points).
+    cell_lat: Optional[float] = None
+    cell_lon: Optional[float] = None
+    time: datetime
+    values: Dict[str, float]
+    series: Optional[Dict[str, List[float]]] = None
+    series_time: Optional[List[datetime]] = None
+
+
+class WeatherOverlayResponse(BaseModel):
+    cell_deg: float
+    hourly: List[str]
+    forecast_days: int
+    time_mode: str
+    target_time: datetime
+    units: Dict[str, str] = {}
+    stats: Dict[str, Dict[str, float]] = {}
+    cells: List[WeatherCell]
 
 # Global variables for model and scaler
 model = None
@@ -179,3 +234,134 @@ async def predict_phase(icao: str):
 @app.get("/health")
 async def health_check():
     return {"status": "ok", "model_loaded": model is not None, "bq_connected": bq_client is not None}
+
+
+@app.post("/weather/overlay", response_model=WeatherOverlayResponse)
+async def weather_overlay_endpoint(req: WeatherOverlayRequest):
+    if not req.trajectory:
+        raise HTTPException(status_code=400, detail="trajectory must be non-empty")
+    if not req.hourly:
+        raise HTTPException(status_code=400, detail="hourly must be non-empty")
+    if req.cell_deg <= 0:
+        raise HTTPException(status_code=400, detail="cell_deg must be > 0")
+    if req.forecast_days <= 0:
+        raise HTTPException(status_code=400, detail="forecast_days must be > 0")
+
+    def _coord_decimals(cell_deg: float) -> int:
+        # For cell_deg=0.01, we want 3 decimals to represent cell centers (…x.xx5).
+        # In general: ceil(-log10(cell_deg)) + 1
+        if cell_deg <= 0:
+            return 6
+        return max(0, int(math.ceil(-math.log10(cell_deg))) + 1)
+
+    decimals = _coord_decimals(req.cell_deg)
+
+    # If we're not densifying and not expanding, we can keep a direct mapping from cell -> input point.
+    input_point_by_cell: Dict[tuple[float, float], tuple[float, float]] = {}
+    if (not req.densify) and req.radius_cells == 0:
+        for p in req.trajectory:
+            c = weather_overlay.cell_center_from_latlon(p.lat, p.lon, req.cell_deg)
+            if c not in input_point_by_cell:
+                input_point_by_cell[c] = (p.lat, p.lon)
+
+    traj_pts = [weather_overlay.TrajectoryPoint(lat=p.lat, lon=p.lon) for p in req.trajectory]
+    base_cells = weather_overlay.cells_from_trajectory(traj_pts, cell_deg=req.cell_deg, densify=req.densify)
+    cells = (
+        weather_overlay.corridor_expand(base_cells, cell_deg=req.cell_deg, radius_cells=req.radius_cells)
+        if req.radius_cells > 0
+        else base_cells
+    )
+
+    if not cells:
+        raise HTTPException(status_code=400, detail="no cells generated from trajectory")
+
+    lats = [c[0] for c in cells]
+    lons = [c[1] for c in cells]
+
+    try:
+        loc_hourlies = open_meteo_client.fetch_hourly(
+            latitudes=lats,
+            longitudes=lons,
+            hourly_vars=req.hourly,
+            forecast_days=req.forecast_days,
+            timezone_name="UTC",
+        )
+    except RuntimeError as e:
+        # dependency missing
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Open-Meteo fetch failed: {e}")
+
+    # Build response
+    target_time = req.target_time or datetime.now(timezone.utc)
+
+    units: Dict[str, str] = {}
+    # Use first response's units (all should match)
+    for lh in loc_hourlies:
+        if lh.units:
+            units = lh.units
+            break
+
+    # Stats across cells for each variable
+    minmax: Dict[str, List[float]] = {v: [] for v in req.hourly}
+    out_cells: List[WeatherCell] = []
+
+    for (latc, lonc), lh in zip(cells, loc_hourlies):
+        df = lh.hourly
+        idx = open_meteo_client.pick_time_index(df["time"], req.target_time, mode=req.time_mode)
+        tsel = df.loc[idx, "time"].to_pydatetime()
+
+        values: Dict[str, float] = {}
+        for v in req.hourly:
+            val = float(df.loc[idx, v])
+            values[v] = val
+            minmax[v].append(val)
+
+        series = None
+        series_time = None
+        if req.include_series:
+            series = {v: [float(x) for x in df[v].to_list()] for v in req.hourly}
+            series_time = [t.to_pydatetime() for t in df["time"].to_list()]
+
+        in_latlon = input_point_by_cell.get((latc, lonc))
+        cell_lat = float(round(latc, decimals))
+        cell_lon = float(round(lonc, decimals))
+
+        # Decide output coordinates
+        if req.coord_mode == "input_point" and in_latlon is not None:
+            out_lat = float(in_latlon[0])
+            out_lon = float(in_latlon[1])
+        else:
+            out_lat = cell_lat
+            out_lon = cell_lon
+
+        out_cells.append(
+            WeatherCell(
+                lat=out_lat,
+                lon=out_lon,
+                input_lat=(float(in_latlon[0]) if in_latlon else None),
+                input_lon=(float(in_latlon[1]) if in_latlon else None),
+                cell_lat=cell_lat,
+                cell_lon=cell_lon,
+                time=tsel,
+                values=values,
+                series=series,
+                series_time=series_time,
+            )
+        )
+
+    stats: Dict[str, Dict[str, float]] = {}
+    for v, vals in minmax.items():
+        if vals:
+            stats[v] = {"min": float(min(vals)), "max": float(max(vals))}
+
+    return WeatherOverlayResponse(
+        cell_deg=req.cell_deg,
+        hourly=req.hourly,
+        forecast_days=req.forecast_days,
+        time_mode=req.time_mode,
+        target_time=target_time,
+        units=units,
+        stats=stats,
+        cells=out_cells,
+    )

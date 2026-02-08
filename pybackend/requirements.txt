@@ -7,3 +7,6 @@ joblib
 pytest
 httpx
 db-dtypes
+requests-cache
+retry-requests
+openmeteo-requests
