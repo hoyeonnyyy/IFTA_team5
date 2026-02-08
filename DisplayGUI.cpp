@@ -9,6 +9,9 @@
 #include <stdlib.h>
 #include <filesystem>
 #include <fileapi.h>
+#include <memory>
+#include <vector>
+#include <System.JSON.hpp>
 
 #pragma hdrstop
 
@@ -33,6 +36,7 @@
 //"https://vrs-standing-data.adsb.lol/routes.csv.gz"
 #define API_SERVICE_URL_JSON  "https://vrs-standing-data.adsb.lol/routes/%.2s/%s.json"
 #define API_SERVICE_URL_TXT  "https://vrs-standing-data.adsb.lol/routes/%.2s/%s.txt"
+#define WEATHER_OVERLAY_URL "http://localhost:8001/weather/overlay"
 #define MAP_CENTER_LAT  40.73612;
 #define MAP_CENTER_LON -80.33158;
 
@@ -109,6 +113,41 @@ uint32_t PopularColors[] = {
    };
 
 }TMultiColor;
+
+typedef struct
+{
+  double lat;
+  double lon;
+  double risk;
+}TRiskOverlayCell;
+
+static std::vector<TRiskOverlayCell> g_RiskOverlayCells;
+static double g_RiskOverlayCellDeg = 0.01;
+static bool g_HaveRiskOverlay = false;
+
+static float RiskToRed(double risk)
+{
+  if (risk >= 80.0) return 1.0f;
+  if (risk >= 60.0) return 1.0f;
+  if (risk >= 30.0) return 1.0f;
+  return 0.0f;
+}
+
+static float RiskToGreen(double risk)
+{
+  if (risk >= 80.0) return 0.0f;
+  if (risk >= 60.0) return 0.55f;
+  if (risk >= 30.0) return 0.84f;
+  return 0.78f;
+}
+
+static float RiskToBlue(double risk)
+{
+  if (risk >= 80.0) return 0.0f;
+  if (risk >= 60.0) return 0.0f;
+  if (risk >= 30.0) return 0.0f;
+  return 0.33f;
+}
 
 
 //---------------------------------------------------------------------------
@@ -218,7 +257,7 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  MapCenterLat=MAP_CENTER_LAT;
  MapCenterLon=MAP_CENTER_LON;
 
- LoadMapFromInternet=false;
+ LoadMapFromInternet=true;
  MapComboBox->ItemIndex=GoogleMaps;
  //MapComboBox->ItemIndex=SkyVector_VFR;
  //MapComboBox->ItemIndex=SkyVector_IFR_Low;
@@ -237,15 +276,32 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  
  NetHTTPClientPrediction= new TNetHTTPClient(this);
  NetHTTPClientPrediction->OnRequestCompleted=NetHTTPClientPredictionRequestCompleted;
+ NetHTTPClientPrediction->OnRequestError=NetHTTPClientPredictionRequestError;
+ NetHTTPClientWeather= new TNetHTTPClient(this);
+ NetHTTPClientWeather->OnRequestCompleted=NetHTTPClientWeatherRequestCompleted;
+ NetHTTPClientWeather->OnRequestError=NetHTTPClientWeatherRequestError;
 
  PhaseLabel= new TLabel(Panel4);
  PhaseLabel->Parent=Panel4;
- PhaseLabel->Left=15;
- PhaseLabel->Top=320;
+ PhaseLabel->Left=5;
+ PhaseLabel->Top=RouteLabel->Top + RouteLabel->Height + 4;
  PhaseLabel->Caption="Phase: N/A";
- PhaseLabel->Font->Color=clLime;
- PhaseLabel->Font->Size=12;
- PhaseLabel->Font->Style = TFontStyles() << fsBold;
+ PhaseLabel->Font->Assign(RouteLabel->Font);
+ PhaseLabel->AutoSize=true;
+ PhaseLabel->BringToFront();
+
+ // Make room for phase line under ROUTE in the Close Control panel.
+ {
+   const int delta = 22;
+   const int panel4Bottom = Panel4->Top + Panel4->Height;
+   Panel4->Height += delta;
+   for (int i = 0; i < Panel3->ControlCount; i++) {
+     TControl *c = Panel3->Controls[i];
+     if (c != Panel4 && c->Top >= panel4Bottom) {
+       c->Top += delta;
+     }
+   }
+ }
 
  printf("init complete\n");
 }
@@ -365,6 +421,31 @@ void __fastcall TForm1::DrawObjects(void)
   glVertex2f(ScrX,ScrY-20.0);
   glVertex2f(ScrX,ScrY+20.0);
   glEnd();
+
+  if (g_HaveRiskOverlay && g_RiskOverlayCellDeg > 0.0)
+  {
+    const double half = g_RiskOverlayCellDeg * 0.5;
+    glLineWidth(1.0);
+    for (size_t ri = 0; ri < g_RiskOverlayCells.size(); ri++)
+    {
+      const TRiskOverlayCell &rc = g_RiskOverlayCells[ri];
+      double x1, y1, x2, y2, x3, y3, x4, y4;
+      LatLon2XY(rc.lat - half, rc.lon - half, x1, y1);
+      LatLon2XY(rc.lat - half, rc.lon + half, x2, y2);
+      LatLon2XY(rc.lat + half, rc.lon + half, x3, y3);
+      LatLon2XY(rc.lat + half, rc.lon - half, x4, y4);
+
+      glColor4f(RiskToRed(rc.risk), RiskToGreen(rc.risk), RiskToBlue(rc.risk), 0.32f);
+      glBegin(GL_TRIANGLES);
+      glVertex2f(x1, y1);
+      glVertex2f(x2, y2);
+      glVertex2f(x3, y3);
+      glVertex2f(x1, y1);
+      glVertex2f(x3, y3);
+      glVertex2f(x4, y4);
+      glEnd();
+    }
+  }
 
 
   uint32_t *Key;
@@ -746,6 +827,163 @@ wchar_t *str = new wchar_t[Str.WideCharBufSize()];
 return Str.WideChar(str, Str.WideCharBufSize());
 }
 //---------------------------------------------------------------------------
+AnsiString __fastcall TForm1::BuildPredictedRoutePointsJson(TADS_B_Aircraft *Data)
+{
+ if (!Data) return "";
+ if (!Data->HaveLatLon || !Data->HaveSpeedAndHeading) return "";
+ if (TimeToGoCheckBox->State != cbChecked) return "";
+
+ // Keep trajectory generation consistent with the yellow prediction line.
+ const double totalDistanceNm = Data->Speed / 3060.0 * TimeToGoTrackBar->Position;
+ if (totalDistanceNm <= 0.0) return "";
+
+ const int sampleCount = 20; // start + 20 intermediates + end
+ TFormatSettings fs = TFormatSettings::Create();
+ fs.DecimalSeparator = '.';
+ double prevLat = 1000.0;
+ double prevLon = 1000.0;
+ bool havePoint = false;
+ int uniqueCount = 0;
+
+ AnsiString points = "";
+ for (int i = 0; i <= sampleCount; i++)
+ {
+   const double frac = (double)i / (double)sampleCount;
+   const double d = totalDistanceNm * frac;
+
+   double lat = 0.0, lon = 0.0, az = 0.0;
+   if (VDirect(Data->Latitude, Data->Longitude, Data->Heading, d, &lat, &lon, &az) != OKNOERROR)
+     continue;
+
+   // Round to 2 decimals as requested.
+   lat = round(lat * 100.0) / 100.0;
+   lon = round(lon * 100.0) / 100.0;
+
+   // De-duplicate consecutive rounded points.
+   if (havePoint && fabs(lat - prevLat) < 0.000001 && fabs(lon - prevLon) < 0.000001)
+     continue;
+
+   if (points.Length() > 0) points += ",";
+   points += "{\"lat\":" + FloatToStrF(lat, ffFixed, 12, 2, fs) + ",\"lon\":" + FloatToStrF(lon, ffFixed, 12, 2, fs) + "}";
+   prevLat = lat;
+   prevLon = lon;
+   havePoint = true;
+   uniqueCount++;
+ }
+
+ if (uniqueCount < 2) return "";
+
+ AnsiString json =
+   "{"
+   "\"trajectory\":[" + points + "],"
+   "\"hourly\":["
+   "\"precipitation\","
+   "\"rain\","
+   "\"snowfall\","
+   "\"precipitation_probability\","
+   "\"weather_code\","
+   "\"cape\","
+   "\"wind_speed_10m\","
+   "\"wind_gusts_10m\","
+   "\"wind_direction_10m\","
+   "\"visibility\","
+   "\"temperature_2m\""
+   "],"
+   "\"forecast_days\":1,"
+   "\"cell_deg\":0.01,"
+   "\"densify\":false,"
+   "\"radius_cells\":0,"
+   "\"time_mode\":\"nearest\","
+   "\"include_series\":false,"
+   "\"risk_profile\":\"safety\","
+   "\"include_risk_details\":false,"
+   "\"coord_mode\":\"input_point\""
+   "}";
+
+ return json;
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
+{
+ AnsiString payload = BuildPredictedRoutePointsJson(Data);
+ if (payload.IsEmpty()) return;
+
+ TStringStream *body = NULL;
+ try
+ {
+  body = new TStringStream((UnicodeString)payload, TEncoding::UTF8, false);
+  System::Net::Urlclient::TNetHeaders headers;
+  headers.Length = 1;
+   headers[0] = System::Net::Urlclient::TNameValuePair("Content-Type", "application/json");
+
+  _di_IHTTPResponse response = NetHTTPClientWeather->Post(AnsiString(WEATHER_OVERLAY_URL), body, NULL, headers);
+  if (!response || (response->StatusCode < 200 || response->StatusCode >= 300))
+  {
+    // Non-fatal: weather overlay is optional.
+    return;
+  }
+
+  UnicodeString content = response->ContentAsString(TEncoding::UTF8);
+  std::unique_ptr<TJSONValue> root(TJSONObject::ParseJSONValue(content));
+  if (!root) return;
+
+  TJSONObject *obj = dynamic_cast<TJSONObject *>(root.get());
+  if (!obj) return;
+
+  TJSONValue *cellDegValue = obj->GetValue("cell_deg");
+  TFormatSettings fs = TFormatSettings::Create();
+  fs.DecimalSeparator = '.';
+  if (cellDegValue)
+  {
+    try
+    {
+      g_RiskOverlayCellDeg = StrToFloat((UnicodeString)cellDegValue->Value(), fs);
+    }
+    catch(...)
+    {
+      g_RiskOverlayCellDeg = 0.01;
+    }
+  }
+
+  TJSONValue *cellsValue = obj->GetValue("cells");
+  TJSONArray *cells = dynamic_cast<TJSONArray *>(cellsValue);
+  if (!cells) return;
+
+  g_RiskOverlayCells.clear();
+  for (int i = 0; i < cells->Count; i++)
+  {
+    TJSONObject *cellObj = dynamic_cast<TJSONObject *>(cells->Items[i]);
+    if (!cellObj) continue;
+
+    TJSONValue *latValue = cellObj->GetValue("cell_lat");
+    TJSONValue *lonValue = cellObj->GetValue("cell_lon");
+    TJSONValue *riskValue = cellObj->GetValue("risk_score");
+    if (!latValue || !lonValue || !riskValue) continue;
+
+    TRiskOverlayCell c;
+    try
+    {
+      c.lat = StrToFloat((UnicodeString)latValue->Value(), fs);
+      c.lon = StrToFloat((UnicodeString)lonValue->Value(), fs);
+      c.risk = StrToFloat((UnicodeString)riskValue->Value(), fs);
+      g_RiskOverlayCells.push_back(c);
+    }
+    catch(...)
+    {
+      continue;
+    }
+  }
+
+  g_HaveRiskOverlay = !g_RiskOverlayCells.empty();
+ }
+ catch(...)
+ {
+   // Non-fatal: keep UI behavior unchanged if backend is unavailable.
+ }
+
+ if (body) delete body;
+}
+//---------------------------------------------------------------------------
  void __fastcall TForm1::HookTrack(int X, int Y,bool CPA_Hook)
  {
   double VLat,VLon, dlat,dlon,Range;
@@ -803,13 +1041,16 @@ return Str.WideChar(str, Str.WideCharBufSize());
          // Call Prediction API
          try{
            AnsiString Url="http://localhost:8001/predict/"+(AnsiString)ADS_B_Aircraft->HexAddr;
-           NetHTTPClientPrediction->Get(Url);
            PhaseLabel->Caption="Phase: Loading...";
+           NetHTTPClientPrediction->Get(Url);
          }
          catch(...)
          {
-             PhaseLabel->Caption="Phase: Error";
+             PhaseLabel->Caption="Phase: N/A";
          }
+
+         // Send rounded intermediate points for weather overlay analysis.
+         SendPredictedRoutePointsToBackend(ADS_B_Aircraft);
 		}
 		else
 		{
@@ -833,7 +1074,10 @@ return Str.WideChar(str, Str.WideCharBufSize());
 		   HdgLabel->Caption="N/A";
 		   AltLabel->Caption="N/A";
 		   MsgCntLabel->Caption="N/A";
-		   TrkLastUpdateTimeLabel->Caption="N/A";
+         TrkLastUpdateTimeLabel->Caption="N/A";
+           PhaseLabel->Caption="Phase: N/A";
+           g_RiskOverlayCells.clear();
+           g_HaveRiskOverlay=false;
 		  }
 		 else
 		   {
@@ -2096,7 +2340,7 @@ void __fastcall TForm1::LIstenClick(TObject *Sender)
 //---------------------------------------------------------------------------
 void __fastcall TForm1::NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse)
 {
-    if (AResponse->StatusCode == 200)
+    if (AResponse && AResponse->StatusCode == 200)
     {
         AnsiString JsonStr = AResponse->ContentAsString(TEncoding::ASCII);
         
@@ -2120,12 +2364,27 @@ void __fastcall TForm1::NetHTTPClientPredictionRequestCompleted(TObject *Sender,
         }
         else
         {
-            PhaseLabel->Caption = "Phase: Unknown Format";
+            PhaseLabel->Caption = "Phase: N/A";
         }
     }
     else
     {
-        PhaseLabel->Caption = "Phase: API Error " + IntToStr(AResponse->StatusCode);
+        PhaseLabel->Caption = "Phase: N/A";
     }
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::NetHTTPClientPredictionRequestError(TObject *Sender, const UnicodeString AError)
+{
+    PhaseLabel->Caption = "Phase: N/A";
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::NetHTTPClientWeatherRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse)
+{
+    // Weather response is handled synchronously in SendPredictedRoutePointsToBackend.
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::NetHTTPClientWeatherRequestError(TObject *Sender, const UnicodeString AError)
+{
+    // Non-fatal: weather overlay should not affect phase UI.
 }
 //---------------------------------------------------------------------------

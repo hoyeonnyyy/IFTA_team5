@@ -2,7 +2,7 @@ object Form1: TForm1
   Left = 0
   Top = 0
   Caption = 'ADS-B Viewer'
-  ClientHeight = 652
+  ClientHeight = 676
   ClientWidth = 1212
   Color = clBtnFace
   Constraints.MinHeight = 740
@@ -46,21 +46,21 @@ object Form1: TForm1
     Left = 962
     Top = 0
     Width = 250
-    Height = 652
+    Height = 676
     Align = alRight
     Color = clWindow
     Constraints.MaxWidth = 250
     TabOrder = 0
-    ExplicitLeft = 946
-    ExplicitHeight = 603
+    ExplicitLeft = 960
+    ExplicitHeight = 668
     object Panel1: TPanel
       Left = 1
-      Top = 504
+      Top = 528
       Width = 248
       Height = 147
       Align = alBottom
       TabOrder = 0
-      ExplicitTop = 455
+      ExplicitTop = 520
       object Label12: TLabel
         Left = 8
         Top = 8
@@ -833,7 +833,7 @@ object Form1: TForm1
     Left = 0
     Top = 0
     Width = 962
-    Height = 652
+    Height = 676
     Cursor = crCross
     Align = alClient
     TabOrder = 1
@@ -856,8 +856,8 @@ object Form1: TForm1
     OnInit = ObjectDisplayInit
     OnResize = ObjectDisplayResize
     OnPaint = ObjectDisplayPaint
-    ExplicitWidth = 946
-    ExplicitHeight = 603
+    ExplicitWidth = 960
+    ExplicitHeight = 668
   end
   object MainMenu1: TMainMenu
     Left = 24

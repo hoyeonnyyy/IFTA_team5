@@ -20,6 +20,7 @@
 #include "FlatEarthView.h"
 #include "ght_hash_table.h"
 #include "TriangulatPoly.h"
+#include "Aircraft.h"
 #include <Dialogs.hpp>
 #include <IdTCPClient.hpp>
 #include <IdTCPConnection.hpp>
@@ -237,6 +238,9 @@ __published:	// IDE-managed Components
           ISpeechRecoResult *Result);
 	void __fastcall LIstenClick(TObject *Sender);
     void __fastcall NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
+    void __fastcall NetHTTPClientPredictionRequestError(TObject *Sender, const UnicodeString AError);
+    void __fastcall NetHTTPClientWeatherRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
+    void __fastcall NetHTTPClientWeatherRequestError(TObject *Sender, const UnicodeString AError);
 
 private:	// User declarations
 
@@ -257,9 +261,12 @@ public:		// User declarations
     void __fastcall CreateBigQueryCSV(void);
     void __fastcall CloseBigQueryCSV(void);
     bool __fastcall LoadARTCCBoundaries(AnsiString FileName);
+    AnsiString __fastcall BuildPredictedRoutePointsJson(TADS_B_Aircraft *Data);
+    void __fastcall SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data);
 
     TLabel                     *PhaseLabel;
     TNetHTTPClient             *NetHTTPClientPrediction;
+    TNetHTTPClient             *NetHTTPClientWeather;
     ISpeechRecoGrammar         *SRGrammar;
 	int                        MouseDownX,MouseDownY;
 	bool                       MouseDown;

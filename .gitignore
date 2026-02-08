@@ -4,11 +4,18 @@ __pycache__/
 
 # Large caches / map tiles / recordings
 GoogleMap/
+GoogleMap_Live/
 VFR_Map/
+VFR_Map_Live/
 IFR_Low_Map/
+IFR_Low_Map_Live/
 IFR_High_Map/
-# Map/
+IFR_High_Map_Live/
+Map/
 Recorded/
+HashTable/
+Components/
+OpenStreetGoogleConversion/
 
 # Large datasets (keep out of git; store/download separately)
 AircraftDB/*.csv
