@@ -11,10 +11,7 @@ IFR_Low_Map/
 IFR_Low_Map_Live/
 IFR_High_Map/
 IFR_High_Map_Live/
-Map/
 Recorded/
-HashTable/
-Components/
 OpenStreetGoogleConversion/
 
 # Large datasets (keep out of git; store/download separately)
@@ -40,8 +37,6 @@ __recovery/
 *.identcache
 
 # Build output folders
-Win64/
-Win32/
 Debug/
 Release/
 
