@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from google.cloud import bigquery
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import math

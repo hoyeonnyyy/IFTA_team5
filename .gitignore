@@ -2,6 +2,11 @@
 
 __pycache__/
 
+# Python HTTP cache (requests-cache)
+.cache.sqlite
+.cache.sqlite-shm
+.cache.sqlite-wal
+
 # Large caches / map tiles / recordings
 GoogleMap/
 GoogleMap_Live/
