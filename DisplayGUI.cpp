@@ -1017,6 +1017,26 @@ void __fastcall TForm1::ClearTrajectoryState()
 __fastcall TForm1::TForm1(TComponent* Owner)
 	: TForm(Owner)
 {
+  SpeechPopup = NULL;
+  SpeechToggleButton = NULL;
+  SpeechPopupStatusLabel = NULL;
+  SpeechPopupTimerLabel = NULL;
+  SpeechWavePaintBox = NULL;
+  SpeechPopupMemo = NULL;
+  SpeechPopupTimer = NULL;
+  WhisperRecording = false;
+  WhisperProcessing = false;
+  ZeroMemory(&WhisperPi, sizeof(WhisperPi));
+  WhisperLogHandle = NULL;
+  WhisperRecordStartTick = 0;
+  SpeechWaveTick = 0;
+  WhisperToolsDir = "";
+  WhisperScriptFile = "";
+  WhisperStopFile = "";
+  WhisperOutFile = "";
+  WhisperLogFile = "";
+  WhisperAudioFile = "";
+
   AircraftDBPathFileName=ExtractFilePath(ExtractFileDir(Application->ExeName)) +AnsiString("..\\AircraftDB\\")+AIRCRAFT_DATABASE_FILE;
   ARTCCBoundaryDataPathFileName=ExtractFilePath(ExtractFileDir(Application->ExeName)) +AnsiString("..\\ARTCC_Boundary_Data\\")+ARTCC_BOUNDARY_FILE;
   BigQueryPath=ExtractFilePath(ExtractFileDir(Application->ExeName)) +AnsiString("..\\BigQuery\\");
@@ -1129,6 +1149,14 @@ __fastcall TForm1::TForm1(TComponent* Owner)
 //---------------------------------------------------------------------------
 __fastcall TForm1::~TForm1()
 {
+ CloseSpeechPopupAndStopProcess(true);
+ if (SpeechPopup)
+ {
+   SpeechPopup->OnClose = NULL;
+   delete SpeechPopup;
+   SpeechPopup = NULL;
+ }
+
  Timer1->Enabled=false;
  Timer2->Enabled=false;
  if (RouteFetchThread)
@@ -3340,13 +3368,565 @@ void __fastcall TForm1::SpSharedRecoContext1Recognition(TObject *Sender, long St
 }
 //---------------------------------------------------------------------------
 
+void __fastcall TForm1::BuildWhisperPaths()
+{
+  WhisperToolsDir = ExtractFilePath(ExtractFileDir(Application->ExeName)) + "..\\Tools\\";
+  if (!DirectoryExists(WhisperToolsDir))
+  {
+    ForceDirectories(WhisperToolsDir);
+  }
+
+  WhisperScriptFile = WhisperToolsDir + "whisper_transcribe.py";
+  WhisperOutFile = WhisperToolsDir + "last_transcript.txt";
+  WhisperStopFile = WhisperToolsDir + "whisper_stop.flag";
+  WhisperLogFile = WhisperToolsDir + "whisper_transcribe.log";
+  WhisperAudioFile = WhisperToolsDir + "last_recording.wav";
+}
+//---------------------------------------------------------------------------
+
+AnsiString __fastcall TForm1::FormatSpeechElapsed(DWORD elapsedMs) const
+{
+  const DWORD totalSeconds = elapsedMs / 1000;
+  const DWORD minutes = totalSeconds / 60;
+  const DWORD seconds = totalSeconds % 60;
+  AnsiString mm = IntToStr((int)minutes);
+  AnsiString ss = IntToStr((int)seconds);
+  if (mm.Length() < 2) mm = "0" + mm;
+  if (ss.Length() < 2) ss = "0" + ss;
+  return mm + ":" + ss;
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::AppendPopupMemoLine(const AnsiString &line)
+{
+  if (SpeechPopupMemo)
+  {
+    SpeechPopupMemo->Lines->Add(line);
+    SpeechPopupMemo->SelStart = SpeechPopupMemo->Text.Length();
+    ::SendMessage((HWND)SpeechPopupMemo->Handle, EM_SCROLLCARET, 0, 0);
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::AppendWhisperLogTail(int maxLines)
+{
+  if (!SpeechPopupMemo || !FileExists(WhisperLogFile))
+    return;
+
+  TStringList *logLines = new TStringList();
+  try
+  {
+    logLines->LoadFromFile(WhisperLogFile);
+  }
+  catch (...)
+  {
+    delete logLines;
+    AppendPopupMemoLine("Unable to read whisper log.");
+    return;
+  }
+
+  AppendPopupMemoLine("---- whisper log ----");
+  int startLine = logLines->Count - maxLines;
+  if (startLine < 0) startLine = 0;
+  for (int i = startLine; i < logLines->Count; i++)
+  {
+    AppendPopupMemoLine(logLines->Strings[i]);
+  }
+  AppendPopupMemoLine("---------------------");
+  delete logLines;
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::CleanupWhisperHandles()
+{
+  if (WhisperPi.hProcess)
+  {
+    CloseHandle(WhisperPi.hProcess);
+    WhisperPi.hProcess = NULL;
+  }
+  if (WhisperPi.hThread)
+  {
+    CloseHandle(WhisperPi.hThread);
+    WhisperPi.hThread = NULL;
+  }
+  if (WhisperLogHandle)
+  {
+    CloseHandle(WhisperLogHandle);
+    WhisperLogHandle = NULL;
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::UpdateSpeechPopupUi(const AnsiString &statusText)
+{
+  if (!SpeechPopup) return;
+
+  if (SpeechPopupStatusLabel)
+    SpeechPopupStatusLabel->Caption = "Status: " + statusText;
+
+  if (SpeechToggleButton)
+  {
+    if (WhisperProcessing)
+    {
+      SpeechToggleButton->Caption = "Processing...";
+      SpeechToggleButton->Enabled = false;
+    }
+    else if (WhisperRecording)
+    {
+      SpeechToggleButton->Caption = "Stop Recording";
+      SpeechToggleButton->Enabled = true;
+    }
+    else
+    {
+      SpeechToggleButton->Caption = "Start Recording";
+      SpeechToggleButton->Enabled = true;
+    }
+  }
+
+  if (SpeechPopupTimerLabel)
+  {
+    DWORD elapsedMs = 0;
+    if (WhisperRecording)
+    {
+      elapsedMs = GetTickCount() - WhisperRecordStartTick;
+    }
+    SpeechPopupTimerLabel->Caption = "Time: " + FormatSpeechElapsed(elapsedMs);
+  }
+
+  if (SpeechWavePaintBox)
+    SpeechWavePaintBox->Repaint();
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::CreateSpeechPopup()
+{
+  if (SpeechPopup) return;
+
+  SpeechPopup = new TForm(this);
+  SpeechPopup->Caption = "Voice Input";
+  SpeechPopup->Position = poMainFormCenter;
+  SpeechPopup->BorderStyle = bsSingle;
+  SpeechPopup->BorderIcons = TBorderIcons() << biSystemMenu;
+  SpeechPopup->ClientWidth = 420;
+  SpeechPopup->ClientHeight = 360;
+  SpeechPopup->Color = clWhite;
+  SpeechPopup->Font->Name = "Segoe UI";
+  SpeechPopup->Font->Size = 9;
+  SpeechPopup->OnClose = SpeechPopupClose;
+
+  SpeechToggleButton = new TButton(SpeechPopup);
+  SpeechToggleButton->Parent = SpeechPopup;
+  SpeechToggleButton->Left = 14;
+  SpeechToggleButton->Top = 14;
+  SpeechToggleButton->Width = 140;
+  SpeechToggleButton->Height = 32;
+  SpeechToggleButton->Caption = "Start Recording";
+  SpeechToggleButton->OnClick = SpeechPopupToggleButtonClick;
+
+  SpeechPopupStatusLabel = new TLabel(SpeechPopup);
+  SpeechPopupStatusLabel->Parent = SpeechPopup;
+  SpeechPopupStatusLabel->Left = 170;
+  SpeechPopupStatusLabel->Top = 14;
+  SpeechPopupStatusLabel->Caption = "Status: Idle";
+  SpeechPopupStatusLabel->Font->Style = TFontStyles() << fsBold;
+
+  SpeechPopupTimerLabel = new TLabel(SpeechPopup);
+  SpeechPopupTimerLabel->Parent = SpeechPopup;
+  SpeechPopupTimerLabel->Left = 170;
+  SpeechPopupTimerLabel->Top = 34;
+  SpeechPopupTimerLabel->Caption = "Time: 00:00";
+
+  SpeechWavePaintBox = new TPaintBox(SpeechPopup);
+  SpeechWavePaintBox->Parent = SpeechPopup;
+  SpeechWavePaintBox->Left = 14;
+  SpeechWavePaintBox->Top = 60;
+  SpeechWavePaintBox->Width = 392;
+  SpeechWavePaintBox->Height = 68;
+  SpeechWavePaintBox->OnPaint = SpeechPopupWavePaint;
+
+  SpeechPopupMemo = new TMemo(SpeechPopup);
+  SpeechPopupMemo->Parent = SpeechPopup;
+  SpeechPopupMemo->Left = 14;
+  SpeechPopupMemo->Top = 136;
+  SpeechPopupMemo->Width = 392;
+  SpeechPopupMemo->Height = 210;
+  SpeechPopupMemo->ReadOnly = true;
+  SpeechPopupMemo->ScrollBars = ssVertical;
+  SpeechPopupMemo->WordWrap = true;
+  SpeechPopupMemo->Color = clWhite;
+  SpeechPopupMemo->Lines->Clear();
+  SpeechPopupMemo->Lines->Add("Press Start Recording and speak.");
+
+  SpeechPopupTimer = new TTimer(SpeechPopup);
+  SpeechPopupTimer->Interval = 80;
+  SpeechPopupTimer->Enabled = true;
+  SpeechPopupTimer->OnTimer = SpeechPopupTimerTick;
+
+  SpeechWaveTick = 0;
+  UpdateSpeechPopupUi("Idle");
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::OpenSpeechPopup()
+{
+  if (!SpeechPopup)
+  {
+    CreateSpeechPopup();
+  }
+
+  if (SpeechPopup)
+  {
+    SpeechPopup->Show();
+    SpeechPopup->BringToFront();
+    SpeechPopup->SetFocus();
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::StartWhisperFromPopup()
+{
+  if (WhisperRecording || WhisperProcessing)
+    return;
+
+  BuildWhisperPaths();
+  if (!FileExists(WhisperScriptFile))
+  {
+    SpeechPopupMemo->Lines->Clear();
+    AppendPopupMemoLine("Cannot find whisper script:");
+    AppendPopupMemoLine(WhisperScriptFile);
+    UpdateSpeechPopupUi("Missing script");
+    return;
+  }
+
+  if (FileExists(WhisperOutFile)) DeleteFileA(WhisperOutFile.c_str());
+  if (FileExists(WhisperStopFile)) DeleteFileA(WhisperStopFile.c_str());
+  if (FileExists(WhisperLogFile)) DeleteFileA(WhisperLogFile.c_str());
+  if (FileExists(WhisperAudioFile)) DeleteFileA(WhisperAudioFile.c_str());
+
+  SpeechPopupMemo->Lines->Clear();
+  AppendPopupMemoLine("Recording started. Press Stop Recording when done.");
+
+  CleanupWhisperHandles();
+  ZeroMemory(&WhisperPi, sizeof(WhisperPi));
+
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = NULL;
+  sa.bInheritHandle = TRUE;
+
+  WhisperLogHandle = CreateFileA(WhisperLogFile.c_str(),
+                                 FILE_APPEND_DATA,
+                                 FILE_SHARE_WRITE | FILE_SHARE_READ,
+                                 &sa,
+                                 OPEN_ALWAYS,
+                                 FILE_ATTRIBUTE_NORMAL,
+                                 NULL);
+  if (WhisperLogHandle == (HANDLE)(::LONG_PTR)-1)
+  {
+    WhisperLogHandle = NULL;
+  }
+
+  if (WhisperLogHandle)
+  {
+    si.hStdInput = NULL;
+    si.hStdOutput = WhisperLogHandle;
+    si.hStdError = WhisperLogHandle;
+    si.dwFlags |= STARTF_USESTDHANDLES;
+  }
+
+  const AnsiString args =
+    "\"" + WhisperOutFile + "\" 0 small --stream --stop-file \"" + WhisperStopFile +
+    "\" --max-seconds 900 --save-audio \"" + WhisperAudioFile + "\"";
+  const AnsiString commandLine = "python \"" + WhisperScriptFile + "\" " + args;
+  char *cmdLineCharArray = new char[strlen(commandLine.c_str()) + 1];
+  strcpy(cmdLineCharArray, commandLine.c_str());
+
+  const BOOL success = CreateProcessA(
+      NULL,
+      cmdLineCharArray,
+      NULL,
+      NULL,
+      (WhisperLogHandle != NULL) ? TRUE : FALSE,
+      CREATE_NO_WINDOW,
+      NULL,
+      NULL,
+      &si,
+      &WhisperPi);
+  delete[] cmdLineCharArray;
+
+  if (!success)
+  {
+    const int err = GetLastError();
+    CleanupWhisperHandles();
+    AppendPopupMemoLine("Failed to start recorder (error " + IntToStr(err) + ").");
+    UpdateSpeechPopupUi("Idle");
+    return;
+  }
+
+  WhisperRecording = true;
+  WhisperProcessing = false;
+  WhisperRecordStartTick = GetTickCount();
+  SpeechWaveTick = 0;
+  UpdateSpeechPopupUi("Recording...");
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::StopWhisperFromPopup()
+{
+  if (!WhisperRecording)
+    return;
+
+  HANDLE stopHandle = CreateFileA(WhisperStopFile.c_str(),
+                                  GENERIC_WRITE,
+                                  FILE_SHARE_READ,
+                                  NULL,
+                                  CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL,
+                                  NULL);
+  if (stopHandle != (HANDLE)(::LONG_PTR)-1)
+  {
+    CloseHandle(stopHandle);
+  }
+
+  WhisperRecording = false;
+  WhisperProcessing = true;
+  AppendPopupMemoLine("Stopping recording and transcribing...");
+  UpdateSpeechPopupUi("Processing...");
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::FinalizeWhisperRun(DWORD exitCode, bool forcedStop)
+{
+  WhisperRecording = false;
+  WhisperProcessing = false;
+  CleanupWhisperHandles();
+
+  if (FileExists(WhisperStopFile))
+  {
+    DeleteFileA(WhisperStopFile.c_str());
+  }
+
+  if (!SpeechPopupMemo)
+  {
+    UpdateSpeechPopupUi("Idle");
+    return;
+  }
+
+  SpeechPopupMemo->Lines->Clear();
+  if (!forcedStop && FileExists(WhisperOutFile))
+  {
+    TStringList *text = new TStringList();
+    try
+    {
+      text->LoadFromFile(WhisperOutFile);
+    }
+    catch (...)
+    {
+      text->Clear();
+      text->Add("Transcription output could not be read.");
+    }
+
+    if (text->Text.Trim().IsEmpty())
+    {
+      SpeechPopupMemo->Lines->Add("(No speech detected.)");
+    }
+    else
+    {
+      SpeechPopupMemo->Lines->AddStrings(text);
+    }
+    delete text;
+  }
+  else
+  {
+    if (forcedStop)
+    {
+      SpeechPopupMemo->Lines->Add("Recording was interrupted before transcription finished.");
+    }
+    else
+    {
+      SpeechPopupMemo->Lines->Add("Transcription failed (exit code " + IntToStr((int)exitCode) + ").");
+      AppendWhisperLogTail(40);
+    }
+  }
+
+  UpdateSpeechPopupUi("Idle");
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::PollWhisperProcessFromPopup()
+{
+  if (!WhisperProcessing || !WhisperPi.hProcess)
+    return;
+
+  const DWORD waitResult = WaitForSingleObject(WhisperPi.hProcess, 0);
+  if (waitResult == WAIT_OBJECT_0)
+  {
+    DWORD exitCode = 0;
+    GetExitCodeProcess(WhisperPi.hProcess, &exitCode);
+    FinalizeWhisperRun(exitCode, false);
+  }
+  else if (waitResult == WAIT_FAILED)
+  {
+    FinalizeWhisperRun((DWORD)-1, true);
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::CloseSpeechPopupAndStopProcess(bool forceTerminate)
+{
+  if (SpeechPopupTimer)
+  {
+    SpeechPopupTimer->Enabled = false;
+  }
+
+  if (WhisperRecording)
+  {
+    HANDLE stopHandle = CreateFileA(WhisperStopFile.c_str(),
+                                    GENERIC_WRITE,
+                                    FILE_SHARE_READ,
+                                    NULL,
+                                    CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL,
+                                    NULL);
+    if (stopHandle != (HANDLE)(::LONG_PTR)-1)
+    {
+      CloseHandle(stopHandle);
+    }
+  }
+
+  if (WhisperPi.hProcess)
+  {
+    DWORD waitResult = WaitForSingleObject(WhisperPi.hProcess, forceTerminate ? 2500 : 250);
+    if (waitResult != WAIT_OBJECT_0 && forceTerminate)
+    {
+      TerminateProcess(WhisperPi.hProcess, 1);
+      waitResult = WaitForSingleObject(WhisperPi.hProcess, 500);
+    }
+
+    if (waitResult == WAIT_OBJECT_0 && !forceTerminate)
+    {
+      DWORD exitCode = 0;
+      GetExitCodeProcess(WhisperPi.hProcess, &exitCode);
+      FinalizeWhisperRun(exitCode, false);
+      return;
+    }
+  }
+
+  WhisperRecording = false;
+  WhisperProcessing = false;
+  CleanupWhisperHandles();
+  if (FileExists(WhisperStopFile))
+  {
+    DeleteFileA(WhisperStopFile.c_str());
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::SpeechPopupToggleButtonClick(TObject *Sender)
+{
+  if (WhisperProcessing)
+    return;
+
+  if (WhisperRecording)
+  {
+    StopWhisperFromPopup();
+  }
+  else
+  {
+    StartWhisperFromPopup();
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::SpeechPopupTimerTick(TObject *Sender)
+{
+  SpeechWaveTick++;
+  if (SpeechWavePaintBox)
+  {
+    SpeechWavePaintBox->Repaint();
+  }
+
+  if (WhisperRecording && SpeechPopupTimerLabel)
+  {
+    SpeechPopupTimerLabel->Caption = "Time: " + FormatSpeechElapsed(GetTickCount() - WhisperRecordStartTick);
+  }
+  else if (!WhisperProcessing && SpeechPopupTimerLabel)
+  {
+    SpeechPopupTimerLabel->Caption = "Time: 00:00";
+  }
+
+  if (WhisperProcessing)
+  {
+    PollWhisperProcessFromPopup();
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::SpeechPopupWavePaint(TObject *Sender)
+{
+  if (!SpeechWavePaintBox) return;
+
+  TCanvas *canvas = SpeechWavePaintBox->Canvas;
+  const TRect r = SpeechWavePaintBox->ClientRect;
+  canvas->Brush->Color = WhisperRecording ? (TColor)RGB(247, 251, 255) : (TColor)RGB(245, 245, 245);
+  canvas->FillRect(r);
+
+  const int w = r.Right - r.Left;
+  const int h = r.Bottom - r.Top;
+  const int midY = h / 2;
+  const int bars = 36;
+  const int barW = 7;
+  const int spacing = (w - (bars * barW)) / (bars + 1);
+  int x = spacing;
+
+  canvas->Pen->Color = (TColor)RGB(220, 220, 220);
+  canvas->MoveTo(0, midY);
+  canvas->LineTo(w, midY);
+
+  TColor waveColor = (TColor)RGB(90, 150, 210);
+  if (WhisperRecording) waveColor = (TColor)RGB(225, 74, 74);
+  if (WhisperProcessing) waveColor = (TColor)RGB(72, 131, 196);
+  canvas->Brush->Color = waveColor;
+  canvas->Pen->Color = waveColor;
+
+  for (int i = 0; i < bars; i++)
+  {
+    double phase = (SpeechWaveTick * 0.32) + (i * 0.45);
+    double amp = 0.10 + 0.05 * fabs(sin(phase));
+    if (WhisperRecording) amp = 0.22 + 0.62 * fabs(sin(phase));
+    else if (WhisperProcessing) amp = 0.14 + 0.18 * fabs(sin(phase * 0.60));
+
+    int halfBar = (int)((h * 0.45) * amp);
+    if (halfBar < 2) halfBar = 2;
+    const int top = midY - halfBar;
+    const int bottom = midY + halfBar;
+    canvas->Rectangle(x, top, x + barW, bottom);
+    x += barW + spacing;
+  }
+}
+//---------------------------------------------------------------------------
+
+void __fastcall TForm1::SpeechPopupClose(TObject *Sender, TCloseAction &Action)
+{
+  CloseSpeechPopupAndStopProcess(true);
+  Action = caFree;
+  SpeechPopup = NULL;
+  SpeechToggleButton = NULL;
+  SpeechPopupStatusLabel = NULL;
+  SpeechPopupTimerLabel = NULL;
+  SpeechWavePaintBox = NULL;
+  SpeechPopupMemo = NULL;
+  SpeechPopupTimer = NULL;
+}
+//---------------------------------------------------------------------------
+
 void __fastcall TForm1::LIstenClick(TObject *Sender)
 {
-    Memo1->Visible=true;
-	SpSharedRecoContext1->EventInterests = SpeechRecoEvents::SREAllEvents;
-	SRGrammar=SpSharedRecoContext1->CreateGrammar(Variant(0));
-	SRGrammar->CmdSetRuleIdState(0, SpeechRuleState::SGDSActive);
-	SRGrammar->DictationSetState(SpeechRuleState::SGDSActive);
+  OpenSpeechPopup();
 }
 //---------------------------------------------------------------------------
 void __fastcall TForm1::NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse)

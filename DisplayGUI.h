@@ -326,6 +326,10 @@ __published:	// IDE-managed Components
           Variant StreamPosition, SpeechRecognitionType RecognitionType,
           ISpeechRecoResult *Result);
 	void __fastcall LIstenClick(TObject *Sender);
+	void __fastcall SpeechPopupToggleButtonClick(TObject *Sender);
+	void __fastcall SpeechPopupTimerTick(TObject *Sender);
+	void __fastcall SpeechPopupWavePaint(TObject *Sender);
+	void __fastcall SpeechPopupClose(TObject *Sender, TCloseAction &Action);
     void __fastcall NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
 	void __fastcall NetHTTPClientPredictionRequestError(TObject *Sender, const UnicodeString AError);
     void __fastcall NetHTTPClientWeatherRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
@@ -334,6 +338,19 @@ __published:	// IDE-managed Components
 	private:	// User declarations
 	friend class TRouteFetchThread;
 	friend class TCO2RecommendThread;
+	void __fastcall OpenSpeechPopup();
+	void __fastcall CreateSpeechPopup();
+	void __fastcall UpdateSpeechPopupUi(const AnsiString &statusText);
+	void __fastcall BuildWhisperPaths();
+	void __fastcall StartWhisperFromPopup();
+	void __fastcall StopWhisperFromPopup();
+	void __fastcall PollWhisperProcessFromPopup();
+	void __fastcall FinalizeWhisperRun(DWORD exitCode, bool forcedStop);
+	void __fastcall CleanupWhisperHandles();
+	void __fastcall CloseSpeechPopupAndStopProcess(bool forceTerminate);
+	AnsiString __fastcall FormatSpeechElapsed(DWORD elapsedMs) const;
+	void __fastcall AppendPopupMemoLine(const AnsiString &line);
+	void __fastcall AppendWhisperLogTail(int maxLines);
 	AnsiString __fastcall NormalizeCodeToken(const AnsiString &value);
 	AnsiString __fastcall NormalizeFlightNum(const AnsiString &value);
 	bool __fastcall DequeueRouteFetch(AnsiString &flightNum);
@@ -437,6 +454,25 @@ __published:	// IDE-managed Components
 	AnsiString                 LastWeatherOverlaySignature;
 	__int64                    LastCO2RecommendPostMs;
 	AnsiString                 LastCO2RecommendSignature;
+	TForm                     *SpeechPopup;
+	TButton                   *SpeechToggleButton;
+	TLabel                    *SpeechPopupStatusLabel;
+	TLabel                    *SpeechPopupTimerLabel;
+	TPaintBox                 *SpeechWavePaintBox;
+	TMemo                     *SpeechPopupMemo;
+	TTimer                    *SpeechPopupTimer;
+	bool                       WhisperRecording;
+	bool                       WhisperProcessing;
+	PROCESS_INFORMATION        WhisperPi;
+	HANDLE                     WhisperLogHandle;
+	DWORD                      WhisperRecordStartTick;
+	int                        SpeechWaveTick;
+	AnsiString                 WhisperToolsDir;
+	AnsiString                 WhisperScriptFile;
+	AnsiString                 WhisperStopFile;
+	AnsiString                 WhisperOutFile;
+	AnsiString                 WhisperLogFile;
+	AnsiString                 WhisperAudioFile;
 };
 //---------------------------------------------------------------------------
 extern PACKAGE TForm1 *Form1;
