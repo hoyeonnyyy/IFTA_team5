@@ -10,3 +10,4 @@ db-dtypes
 requests-cache
 retry-requests
 openmeteo-requests
+openap

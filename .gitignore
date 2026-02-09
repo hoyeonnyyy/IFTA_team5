@@ -7,6 +7,11 @@ __pycache__/
 .cache.sqlite-shm
 .cache.sqlite-wal
 
+# Notebook / ad-hoc caches
+openmeteo_cache.sqlite
+openmeteo_cache.sqlite-shm
+openmeteo_cache.sqlite-wal
+
 # Large caches / map tiles / recordings
 GoogleMap/
 GoogleMap_Live/

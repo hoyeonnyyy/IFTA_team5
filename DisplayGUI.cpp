@@ -41,6 +41,7 @@
 #define API_SERVICE_URL_JSON  "https://vrs-standing-data.adsb.lol/routes/%.2s/%s.json"
 #define API_SERVICE_URL_TXT  "https://vrs-standing-data.adsb.lol/routes/%.2s/%s.txt"
 #define WEATHER_OVERLAY_URL "http://localhost:8001/weather/overlay"
+#define CO2_RECOMMEND_URL "http://localhost:8001/co2/recommend"
 #define MAP_CENTER_LAT  40.73612;
 #define MAP_CENTER_LON -80.33158;
 
@@ -59,6 +60,7 @@
 #define TURN_PHASE_MAX_SECONDS 300
 #define ARRIVAL_THRESHOLD_NM 0.5
 #define WEATHER_POST_THROTTLE_MS 2000
+#define CO2_RECOMMEND_THROTTLE_MS 10000
 
 
 #define BG_INTENSITY   0.37
@@ -285,6 +287,149 @@ __fastcall TRouteFetchThread::TRouteFetchThread(bool value)
 __fastcall TRouteFetchThread::~TRouteFetchThread()
 {
 }
+
+//---------------------------------------------------------------------------
+__fastcall TCO2RecommendThread::TCO2RecommendThread(bool value)
+	: TThread(value)
+{
+	FreeOnTerminate = false;
+}
+
+//---------------------------------------------------------------------------
+__fastcall TCO2RecommendThread::~TCO2RecommendThread()
+{
+}
+
+//---------------------------------------------------------------------------
+void __fastcall TCO2RecommendThread::DoFetch(void)
+{
+	if (!Form1) return;
+
+	TCO2RecommendRequest reqLocal;
+	if (!Form1->DequeueCO2Recommend(reqLocal)) return;
+	Req = reqLocal;
+
+	TFormatSettings fs = TFormatSettings::Create();
+	fs.DecimalSeparator = '.';
+
+	AnsiString payload =
+		"{" 
+		"\"start_lat\":" + FloatToStrF(Req.StartLat, ffFixed, 12, 6, fs) + "," 
+		"\"start_lon\":" + FloatToStrF(Req.StartLon, ffFixed, 12, 6, fs) + "," 
+		"\"end_lat\":" + FloatToStrF(Req.EndLat, ffFixed, 12, 6, fs) + "," 
+		"\"end_lon\":" + FloatToStrF(Req.EndLon, ffFixed, 12, 6, fs) + "," 
+		"\"n_perturbations\":15," 
+		"\"n_points\":10," 
+		"\"wind_level\":\"300hPa\"," 
+		"\"aircraft\":\"A320\"," 
+		"\"cruise_alt_ft\":35000," 
+		"\"cruise_tas_kt\":450," 
+		"\"mass_kg\":65000," 
+		"\"co2_kg_per_kg_fuel\":3.16" 
+		"}";
+
+	bool success = false;
+	std::vector<TGeoPoint> points;
+	double co2BestKg = 0.0;
+	double co2GeodesicKg = 0.0;
+	double co2ReductionKg = 0.0;
+
+	TNetHTTPClient *client = new TNetHTTPClient(NULL);
+	TStringStream *body = NULL;
+	try
+	{
+		body = new TStringStream((UnicodeString)payload, TEncoding::UTF8, false);
+		System::Net::Urlclient::TNetHeaders headers;
+		headers.Length = 1;
+		headers[0] = System::Net::Urlclient::TNameValuePair("Content-Type", "application/json");
+
+		_di_IHTTPResponse response = client->Post(AnsiString(CO2_RECOMMEND_URL), body, NULL, headers);
+		if (response && response->StatusCode >= 200 && response->StatusCode < 300)
+		{
+			UnicodeString content = response->ContentAsString(TEncoding::UTF8);
+			std::unique_ptr<TJSONValue> root(TJSONObject::ParseJSONValue(content));
+			TJSONObject *obj = root ? dynamic_cast<TJSONObject *>(root.get()) : NULL;
+			if (obj)
+			{
+				TJSONArray *bestPoints = dynamic_cast<TJSONArray *>(obj->GetValue("best_points"));
+				TJSONValue *bestCo2Value = obj->GetValue("co2_best_kg");
+				TJSONValue *geoCo2Value = obj->GetValue("co2_geodesic_kg");
+				TJSONValue *redValue = obj->GetValue("co2_reduction_kg");
+
+				if (bestPoints && bestPoints->Count >= 2)
+				{
+					for (int i = 0; i < bestPoints->Count; i++)
+					{
+						TJSONObject *pObj = dynamic_cast<TJSONObject *>(bestPoints->Items[i]);
+						if (!pObj) continue;
+						TJSONValue *latV = pObj->GetValue("lat");
+						TJSONValue *lonV = pObj->GetValue("lon");
+						if (!latV || !lonV) continue;
+						try
+						{
+							TGeoPoint p;
+							p.lat = StrToFloat((UnicodeString)latV->Value(), fs);
+							p.lon = StrToFloat((UnicodeString)lonV->Value(), fs);
+							points.push_back(p);
+						}
+						catch(...)
+						{
+							continue;
+						}
+					}
+				}
+
+				try
+				{
+					if (bestCo2Value) co2BestKg = StrToFloat((UnicodeString)bestCo2Value->Value(), fs);
+					if (geoCo2Value) co2GeodesicKg = StrToFloat((UnicodeString)geoCo2Value->Value(), fs);
+					if (redValue) co2ReductionKg = StrToFloat((UnicodeString)redValue->Value(), fs);
+				}
+				catch(...)
+				{
+					co2BestKg = 0.0;
+					co2GeodesicKg = 0.0;
+					co2ReductionKg = 0.0;
+				}
+
+				success = (points.size() >= 2);
+			}
+		}
+	}
+	catch(...)
+	{
+		success = false;
+		points.clear();
+	}
+
+	if (body) delete body;
+	delete client;
+
+	if (Form1)
+		Form1->StoreCO2RecommendResult(Req, success, points, co2BestKg, co2GeodesicKg, co2ReductionKg);
+}
+
+//---------------------------------------------------------------------------
+void __fastcall TCO2RecommendThread::Execute(void)
+{
+	while (!Terminated)
+	{
+		if (!Form1)
+		{
+			Sleep(100);
+			continue;
+		}
+		try
+		{
+			DoFetch();
+		}
+		catch(...)
+		{
+			// ignore
+		}
+		Sleep(50);
+	}
+}
 //---------------------------------------------------------------------------
 void __fastcall TRouteFetchThread::DoFetch(void)
 {
@@ -396,6 +541,20 @@ bool __fastcall TForm1::DequeueRouteFetch(AnsiString &flightNum)
 	return haveData;
 }
 //---------------------------------------------------------------------------
+bool __fastcall TForm1::DequeueCO2Recommend(TCO2RecommendRequest &req)
+{
+	bool haveData = false;
+	CO2Cs->Acquire();
+	if (!CO2RecommendQueue.empty())
+	{
+		req = CO2RecommendQueue.front();
+		CO2RecommendQueue.pop_front();
+		haveData = true;
+	}
+	CO2Cs->Release();
+	return haveData;
+}
+//---------------------------------------------------------------------------
 void __fastcall TForm1::StoreRouteFetchResult(const AnsiString &flightNum,
 											  bool success,
 											  const AnsiString &routeText,
@@ -478,6 +637,95 @@ void __fastcall TForm1::EnqueueRouteFetch(const AnsiString &flightNum)
 	entry.Status = RFS_PENDING;
 	entry.LastAttemptMs = now;
 	RouteCacheCs->Release();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::EnqueueCO2Recommend(const TCO2RecommendRequest &req)
+{
+	CO2Cs->Acquire();
+	CO2RecommendQueue.clear();
+	CO2RecommendQueue.push_back(req);
+	CO2Cs->Release();
+}
+
+//---------------------------------------------------------------------------
+void __fastcall TForm1::StoreCO2RecommendResult(const TCO2RecommendRequest &req,
+									   bool success,
+									   const std::vector<TGeoPoint> &points,
+									   double co2BestKg,
+									   double co2GeodesicKg,
+									   double co2ReductionKg)
+{
+	if (req.Signature.IsEmpty()) return;
+	if (req.Signature != LastCO2RecommendSignature) return;
+
+	CO2Cs->Acquire();
+	CO2OptimalState.ICAO = req.ICAO;
+	CO2OptimalState.Signature = req.Signature;
+	if (!success)
+	{
+		CO2OptimalState.Valid = false;
+		CO2OptimalState.Points.clear();
+		CO2OptimalState.Co2BestKg = 0.0;
+		CO2OptimalState.Co2GeodesicKg = 0.0;
+		CO2OptimalState.Co2ReductionKg = 0.0;
+	}
+	else
+	{
+		CO2OptimalState.Valid = true;
+		CO2OptimalState.Points = points;
+		CO2OptimalState.Co2BestKg = co2BestKg;
+		CO2OptimalState.Co2GeodesicKg = co2GeodesicKg;
+		CO2OptimalState.Co2ReductionKg = co2ReductionKg;
+	}
+	CO2Cs->Release();
+}
+
+//---------------------------------------------------------------------------
+void __fastcall TForm1::DrawOptimalTrajectory(const std::vector<TGeoPoint> &points)
+{
+	if (points.size() < 2) return;
+
+	glPushAttrib(GL_ENABLE_BIT | GL_LINE_BIT | GL_POINT_BIT | GL_CURRENT_BIT);
+	glColor4f(0.0, 0.0, 1.0, 1.0);
+	glDisable(GL_LINE_STIPPLE);
+	glLineWidth(3.0);
+	glPointSize(6.0f);
+
+	bool stripOpen = false;
+	for (size_t i = 0; i < points.size(); i++)
+	{
+		if ((i > 0) && (fabs(points[i - 1].lon - points[i].lon) > 180.0))
+		{
+			if (stripOpen)
+			{
+				glEnd();
+				stripOpen = false;
+			}
+		}
+
+		if (!stripOpen)
+		{
+			glBegin(GL_LINE_STRIP);
+			stripOpen = true;
+		}
+		double x = 0.0;
+		double y = 0.0;
+		LatLon2XY(points[i].lat, points[i].lon, x, y);
+		glVertex2f(x, y);
+	}
+	if (stripOpen) glEnd();
+
+	glBegin(GL_POINTS);
+	for (size_t i = 0; i < points.size(); i++)
+	{
+		double x = 0.0;
+		double y = 0.0;
+		LatLon2XY(points[i].lat, points[i].lon, x, y);
+		glVertex2f(x, y);
+	}
+	glEnd();
+
+	glPopAttrib();
 }
 //---------------------------------------------------------------------------
 bool __fastcall TForm1::TryGetCachedRoute(const AnsiString &flightNum, TRouteCacheEntry &entry)
@@ -752,6 +1000,14 @@ void __fastcall TForm1::ClearTrajectoryState()
 	TrajectoryState.LastRouteKey = "";
 	TrajectoryState.HadDestination = false;
 	LastWeatherOverlaySignature = "";
+	LastCO2RecommendSignature = "";
+	CO2OptimalState.Valid = false;
+	CO2OptimalState.ICAO = 0;
+	CO2OptimalState.Signature = "";
+	CO2OptimalState.Points.clear();
+	CO2OptimalState.Co2BestKg = 0.0;
+	CO2OptimalState.Co2GeodesicKg = 0.0;
+	CO2OptimalState.Co2ReductionKg = 0.0;
 }
 //---------------------------------------------------------------------------
 
@@ -773,9 +1029,13 @@ __fastcall TForm1::TForm1(TComponent* Owner)
   RecordRawStream=NULL;
   PlayBackRawStream=NULL;
   RouteCacheCs = new System::Syncobjs::TCriticalSection();
+	CO2Cs = new System::Syncobjs::TCriticalSection();
   RouteFetchThread = NULL;
+	CO2RecommendThread = NULL;
   LastWeatherOverlayPostMs = 0;
   LastWeatherOverlaySignature = "";
+	LastCO2RecommendPostMs = 0;
+	LastCO2RecommendSignature = "";
   TrackHook.Valid_CC=false;
   TrackHook.Valid_CPA=false;
   ClearTrajectoryState();
@@ -834,9 +1094,18 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  PhaseLabel->AutoSize=true;
  PhaseLabel->BringToFront();
 
+ Co2Label= new TLabel(Panel4);
+ Co2Label->Parent=Panel4;
+ Co2Label->Left=5;
+ Co2Label->Top=PhaseLabel->Top + PhaseLabel->Height + 4;
+ Co2Label->Caption="CO2 Saved: N/A";
+ Co2Label->Font->Assign(RouteLabel->Font);
+ Co2Label->AutoSize=true;
+ Co2Label->BringToFront();
+
  // Make room for phase line under ROUTE in the Close Control panel.
  {
-   const int delta = 22;
+	const int delta = 44;
    const int panel4Bottom = Panel4->Top + Panel4->Height;
    Panel4->Height += delta;
    for (int i = 0; i < Panel3->ControlCount; i++) {
@@ -850,6 +1119,10 @@ __fastcall TForm1::TForm1(TComponent* Owner)
 	 RouteFetchThread = new TRouteFetchThread(true);
 	 RouteFetchThread->FreeOnTerminate = false;
 	 RouteFetchThread->Resume();
+
+	 CO2RecommendThread = new TCO2RecommendThread(true);
+	 CO2RecommendThread->FreeOnTerminate = false;
+	 CO2RecommendThread->Resume();
 
 	 printf("init complete\n");
 }
@@ -865,10 +1138,22 @@ __fastcall TForm1::~TForm1()
    delete RouteFetchThread;
    RouteFetchThread = NULL;
  }
+ if (CO2RecommendThread)
+ {
+	 CO2RecommendThread->Terminate();
+	 CO2RecommendThread->WaitFor();
+	 delete CO2RecommendThread;
+	 CO2RecommendThread = NULL;
+ }
  if (RouteCacheCs)
  {
    delete RouteCacheCs;
    RouteCacheCs = NULL;
+ }
+ if (CO2Cs)
+ {
+	 delete CO2Cs;
+	 CO2Cs = NULL;
  }
  delete g_EarthView;
  if (g_GETileManager) delete g_GETileManager;
@@ -1266,11 +1551,73 @@ void __fastcall TForm1::DrawObjects(void)
 				LastWeatherOverlayPostMs = nowMs;
 				LastWeatherOverlaySignature = signature;
 			  }
+
+			  // CO2-optimal recommendation uses current position + destination.
+			  if (hasDestination && routePtr && routePtr->HaveDestination)
+			  {
+				TFormatSettings fs = TFormatSettings::Create();
+				fs.DecimalSeparator = '.';
+				double sLat = round(Data->Latitude * 100.0) / 100.0;
+				double sLon = round(Data->Longitude * 100.0) / 100.0;
+				double eLat = round(routePtr->DestLat * 100.0) / 100.0;
+				double eLon = round(routePtr->DestLon * 100.0) / 100.0;
+				AnsiString co2Sig = IntToStr((int)Data->ICAO) + ":" +
+					FloatToStrF(sLat, ffFixed, 12, 2, fs) + "," + FloatToStrF(sLon, ffFixed, 12, 2, fs) + "->" +
+					FloatToStrF(eLat, ffFixed, 12, 2, fs) + "," + FloatToStrF(eLon, ffFixed, 12, 2, fs);
+
+				bool haveCo2ForSig = false;
+				CO2Cs->Acquire();
+				haveCo2ForSig = CO2OptimalState.Valid &&
+					(CO2OptimalState.ICAO == Data->ICAO) &&
+					(CO2OptimalState.Signature == co2Sig);
+				CO2Cs->Release();
+
+				const bool allowByThrottle = (LastCO2RecommendPostMs == 0) ||
+					((nowMs - LastCO2RecommendPostMs) >= CO2_RECOMMEND_THROTTLE_MS);
+				const bool signatureChanged = (co2Sig != LastCO2RecommendSignature);
+				const bool retrySameSignature = (!signatureChanged && !haveCo2ForSig);
+
+				if (!co2Sig.IsEmpty() && allowByThrottle && (signatureChanged || retrySameSignature))
+				{
+					TCO2RecommendRequest req;
+					req.Signature = co2Sig;
+					req.ICAO = Data->ICAO;
+					req.StartLat = Data->Latitude;
+					req.StartLon = Data->Longitude;
+					req.EndLat = routePtr->DestLat;
+					req.EndLon = routePtr->DestLon;
+					EnqueueCO2Recommend(req);
+					LastCO2RecommendSignature = co2Sig;
+					LastCO2RecommendPostMs = nowMs;
+					if (Co2Label) Co2Label->Caption = "CO2 Saved: Loading...";
+				}
+			  }
 			}
 			else ClearTrajectoryState();
 		  }
 		  if (TrajectoryState.Valid)
+		  {
 			DrawTrajectory(TrajectoryState.Points, TrajectoryState.HadDestination);
+			// Draw optimal CO2 path in blue, if it matches the current request.
+			CO2Cs->Acquire();
+			bool haveCO2 = CO2OptimalState.Valid && (CO2OptimalState.ICAO == Data->ICAO) &&
+						  (CO2OptimalState.Signature == LastCO2RecommendSignature) &&
+						  (CO2OptimalState.Points.size() >= 2);
+			std::vector<TGeoPoint> bestPts = CO2OptimalState.Points;
+			double redKg = CO2OptimalState.Co2ReductionKg;
+			CO2Cs->Release();
+			if (haveCO2)
+			{
+				DrawOptimalTrajectory(bestPts);
+				if (Co2Label)
+					Co2Label->Caption = "CO2 Saved: " + FloatToStrF(redKg, ffFixed, 12, 1) + " kg";
+			}
+			else
+			{
+				if (Co2Label && LastCO2RecommendSignature.IsEmpty())
+					Co2Label->Caption = "CO2 Saved: N/A";
+			}
+		  }
 		}
 		else ClearTrajectoryState();
         }
@@ -1289,12 +1636,14 @@ void __fastcall TForm1::DrawObjects(void)
 		 AltLabel->Caption="N/A";
 		 MsgCntLabel->Caption="N/A";
          TrkLastUpdateTimeLabel->Caption="N/A";
+			 if (Co2Label) Co2Label->Caption = "CO2 Saved: N/A";
         }
  }
  else
  {
    ClearTrajectoryState();
    RouteLabel->Caption="N/A";
+	 if (Co2Label) Co2Label->Caption = "CO2 Saved: N/A";
  }
  if (TrackHook.Valid_CPA)
  {
@@ -1737,6 +2086,7 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
 		   MsgCntLabel->Caption="N/A";
          TrkLastUpdateTimeLabel->Caption="N/A";
            PhaseLabel->Caption="Phase: N/A";
+			 if (Co2Label) Co2Label->Caption = "CO2 Saved: N/A";
            g_RiskOverlayCells.clear();
            g_HaveRiskOverlay=false;
 		  }

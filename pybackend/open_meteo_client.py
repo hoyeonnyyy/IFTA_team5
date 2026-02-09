@@ -4,8 +4,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import os
+import tempfile
+
 import pandas as pd
 import numpy as np
+
+
+_DEFAULT_CACHE_DIR = os.path.join(tempfile.gettempdir(), "adsb_openmeteo_cache")
 
 
 @dataclass(frozen=True)
@@ -29,7 +35,7 @@ def fetch_hourly(
     hourly_vars: Sequence[str] | str,
     forecast_days: int = 1,
     timezone_name: str = "UTC",
-    cache_dir: str = ".cache",
+    cache_dir: str = _DEFAULT_CACHE_DIR,
     cache_expire_seconds: int = 3600,
     retries: int = 5,
     backoff_factor: float = 0.2,

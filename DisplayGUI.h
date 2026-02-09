@@ -91,6 +91,27 @@ typedef struct
  bool HadDestination;
 }TTrajectoryState;
 
+typedef struct
+{
+ bool Valid;
+ uint32_t ICAO;
+ AnsiString Signature;
+ std::vector<TGeoPoint> Points;
+ double Co2BestKg;
+ double Co2GeodesicKg;
+ double Co2ReductionKg;
+}TCO2OptimalState;
+
+typedef struct
+{
+ AnsiString Signature;
+ uint32_t ICAO;
+ double StartLat;
+ double StartLon;
+ double EndLat;
+ double EndLon;
+}TCO2RecommendRequest;
+
 
 #define MAX_AREA_POINTS 500
 typedef struct
@@ -150,6 +171,19 @@ protected:
 public:
 	__fastcall TRouteFetchThread(bool value);
 	~TRouteFetchThread();
+};
+
+// Background worker for CO2-optimal trajectory recommendation.
+class TCO2RecommendThread : public TThread
+{
+private:
+	TCO2RecommendRequest Req;
+	void __fastcall DoFetch(void);
+protected:
+	void __fastcall Execute(void);
+public:
+	__fastcall TCO2RecommendThread(bool value);
+	~TCO2RecommendThread();
 };
 //---------------------------------------------------------------------------
 //---------------------------------------------------------------------------
@@ -299,9 +333,11 @@ __published:	// IDE-managed Components
 
 	private:	// User declarations
 	friend class TRouteFetchThread;
+	friend class TCO2RecommendThread;
 	AnsiString __fastcall NormalizeCodeToken(const AnsiString &value);
 	AnsiString __fastcall NormalizeFlightNum(const AnsiString &value);
 	bool __fastcall DequeueRouteFetch(AnsiString &flightNum);
+	bool __fastcall DequeueCO2Recommend(TCO2RecommendRequest &req);
 	void __fastcall StoreRouteFetchResult(const AnsiString &flightNum,
 										  bool success,
 										  const AnsiString &routeText,
@@ -309,6 +345,12 @@ __published:	// IDE-managed Components
 										  bool haveDestination,
 										  double destLat,
 										  double destLon);
+	void __fastcall StoreCO2RecommendResult(const TCO2RecommendRequest &req,
+									   bool success,
+									   const std::vector<TGeoPoint> &points,
+									   double co2BestKg,
+									   double co2GeodesicKg,
+									   double co2ReductionKg);
 
 	public:		// User declarations
 	__fastcall TForm1(TComponent* Owner);
@@ -327,11 +369,13 @@ __published:	// IDE-managed Components
 	void __fastcall CloseBigQueryCSV(void);
 	bool __fastcall LoadARTCCBoundaries(AnsiString FileName);
 	void __fastcall EnqueueRouteFetch(const AnsiString &flightNum);
+	void __fastcall EnqueueCO2Recommend(const TCO2RecommendRequest &req);
 	bool __fastcall TryGetCachedRoute(const AnsiString &flightNum, TRouteCacheEntry &entry);
 	bool __fastcall ParseDestinationCode(const AnsiString &routeText, AnsiString &destCode);
 	bool __fastcall BuildTrajectory(const TADS_B_Aircraft *data, const TRouteCacheEntry *routeEntry,
 									 std::vector<TGeoPoint> &outPoints, bool &hasDestination);
 	void __fastcall DrawTrajectory(const std::vector<TGeoPoint> &points, bool hasDestination);
+	void __fastcall DrawOptimalTrajectory(const std::vector<TGeoPoint> &points);
 	void __fastcall ClearTrajectoryState();
 	AnsiString __fastcall BuildPredictedRoutePointsJsonFromPoints(const std::vector<TGeoPoint> &points);
 	void __fastcall SendPredictedRoutePointsToBackendFromPoints(const std::vector<TGeoPoint> &points);
@@ -339,6 +383,7 @@ __published:	// IDE-managed Components
 	void __fastcall SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data);
 
     TLabel                     *PhaseLabel;
+	TLabel                     *Co2Label;
     TNetHTTPClient             *NetHTTPClientPrediction;
     TNetHTTPClient             *NetHTTPClientWeather;
     ISpeechRecoGrammar         *SRGrammar;
@@ -381,11 +426,17 @@ __published:	// IDE-managed Components
 	AnsiString                 AirportLookupPathFileName;
 	std::map<AnsiString, TRouteCacheEntry> RouteCache;
 	std::deque<AnsiString>     RouteFetchQueue;
+	std::deque<TCO2RecommendRequest> CO2RecommendQueue;
 	System::Syncobjs::TCriticalSection *RouteCacheCs;
+	System::Syncobjs::TCriticalSection *CO2Cs;
 	TRouteFetchThread         *RouteFetchThread;
+	TCO2RecommendThread       *CO2RecommendThread;
 	TTrajectoryState           TrajectoryState;
+	TCO2OptimalState           CO2OptimalState;
 	__int64                    LastWeatherOverlayPostMs;
 	AnsiString                 LastWeatherOverlaySignature;
+	__int64                    LastCO2RecommendPostMs;
+	AnsiString                 LastCO2RecommendSignature;
 };
 //---------------------------------------------------------------------------
 extern PACKAGE TForm1 *Form1;
