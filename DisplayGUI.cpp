@@ -7,9 +7,12 @@
 #include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <algorithm>
+#include <ctype.h>
 #include <filesystem>
 #include <fileapi.h>
 #include <memory>
+#include <string>
 #include <vector>
 #include <System.JSON.hpp>
 
@@ -28,6 +31,7 @@
 #include "SBS_Message.h"
 #include "CPA.h"
 #include "AircraftDB.h"
+#include "AirportLookup.h"
 #include "csv.h"
 
 #define AIRCRAFT_DATABASE_URL   "https://opensky-network.org/datasets/metadata/aircraftDatabase.zip"
@@ -45,6 +49,16 @@
 #define   LEFT_MOUSE_DOWN   1
 #define   RIGHT_MOUSE_DOWN  2
 #define   MIDDLE_MOUSE_DOWN 4
+#define TRAJECTORY_LEAD_SECONDS 60.0
+#define TRAJECTORY_POINT_SPACING_SECONDS 30.0
+#define TRAJECTORY_MAX_POINTS 200
+#define ROUTE_FETCH_RETRY_COOLDOWN_MS 30000
+#define TURN_DT_SECONDS 1.0
+#define TURN_RATE_DEG_PER_SEC 3.0
+#define HEADING_ALIGN_DEG 2.0
+#define TURN_PHASE_MAX_SECONDS 300
+#define ARRIVAL_THRESHOLD_NM 0.5
+#define WEATHER_POST_THROTTLE_MS 2000
 
 
 #define BG_INTENSITY   0.37
@@ -149,6 +163,46 @@ static float RiskToBlue(double risk)
   return 0.33f;
 }
 
+static double NormalizeHeading360(double hdg)
+{
+  while (hdg < 0.0) hdg += 360.0;
+  while (hdg >= 360.0) hdg -= 360.0;
+  return hdg;
+}
+
+static double NormalizeHeadingSignedDiff(double target, double current)
+{
+  double diff = target - current;
+  while (diff > 180.0) diff -= 360.0;
+  while (diff < -180.0) diff += 360.0;
+  return diff;
+}
+
+static AnsiString BuildTrajectorySignature(const std::vector<TGeoPoint> &points)
+{
+  TFormatSettings fs = TFormatSettings::Create();
+  fs.DecimalSeparator = '.';
+  AnsiString sig = "";
+  double prevLat = 1000.0;
+  double prevLon = 1000.0;
+  bool havePoint = false;
+
+  for (size_t i = 0; i < points.size(); i++)
+  {
+    double lat = round(points[i].lat * 100.0) / 100.0;
+    double lon = round(points[i].lon * 100.0) / 100.0;
+
+    if (havePoint && fabs(lat - prevLat) < 0.000001 && fabs(lon - prevLon) < 0.000001)
+      continue;
+
+    sig += FloatToStrF(lat, ffFixed, 12, 2, fs) + "," + FloatToStrF(lon, ffFixed, 12, 2, fs) + ";";
+    prevLat = lat;
+    prevLon = lon;
+    havePoint = true;
+  }
+  return sig;
+}
+
 
 //---------------------------------------------------------------------------
 static const char * strnistr(const char * pszSource, DWORD dwLength, const char * pszFind)
@@ -222,6 +276,486 @@ static char *stristr(const char *String, const char *Pattern)
    return(NULL);
 }
 //---------------------------------------------------------------------------
+__fastcall TRouteFetchThread::TRouteFetchThread(bool value)
+	: TThread(value)
+{
+	FreeOnTerminate = false;
+}
+//---------------------------------------------------------------------------
+__fastcall TRouteFetchThread::~TRouteFetchThread()
+{
+}
+//---------------------------------------------------------------------------
+void __fastcall TRouteFetchThread::DoFetch(void)
+{
+	if (!Form1) return;
+
+	AnsiString flight = Form1->NormalizeFlightNum(FlightNum);
+	if (flight.IsEmpty())
+	{
+	  Form1->StoreRouteFetchResult(flight,false,"","",false,0.0,0.0);
+	  return;
+	}
+
+	AnsiString routeText = "";
+	AnsiString destCode = "";
+	double destLat = 0.0;
+	double destLon = 0.0;
+	bool success = false;
+	bool haveDestination = false;
+
+	TNetHTTPClient *client = new TNetHTTPClient(NULL);
+	try
+	{
+	  _di_IHTTPResponse response;
+	  char getStr[1024];
+	  snprintf(getStr, sizeof(getStr), API_SERVICE_URL_TXT, flight.c_str(), flight.c_str());
+	  response = client->Get(AnsiString(getStr));
+	  if (response && response->StatusCode == 200)
+	  {
+		routeText = Trim(response->ContentAsString(TEncoding::ASCII));
+		success = !routeText.IsEmpty();
+		if (success && Form1->ParseDestinationCode(routeText, destCode))
+		{
+		  if (LookupAirportByCode(destCode, destLat, destLon))
+			haveDestination = true;
+		}
+	  }
+	}
+	catch (...)
+	{
+	  success = false;
+	  routeText = "";
+	  destCode = "";
+	  haveDestination = false;
+	}
+	delete client;
+
+	Form1->StoreRouteFetchResult(flight, success, routeText, destCode, haveDestination, destLat, destLon);
+}
+//---------------------------------------------------------------------------
+void __fastcall TRouteFetchThread::Execute(void)
+{
+	while (!Terminated)
+	{
+	  if (!Form1)
+	  {
+		Sleep(100);
+		continue;
+	  }
+
+	  if (!Form1->DequeueRouteFetch(FlightNum))
+	  {
+		Sleep(100);
+		continue;
+	  }
+
+	  try
+	  {
+		DoFetch();
+	  }
+	  catch(...)
+	  {
+		AnsiString flight = Form1->NormalizeFlightNum(FlightNum);
+		Form1->StoreRouteFetchResult(flight,false,"","",false,0.0,0.0);
+	  }
+	}
+}
+//---------------------------------------------------------------------------
+AnsiString __fastcall TForm1::NormalizeCodeToken(const AnsiString &value)
+{
+	AnsiString out = "";
+	const char *ptr = value.c_str();
+	if (!ptr) return out;
+
+	for (size_t i = 0; ptr[i] != 0; i++)
+	{
+	  unsigned char c = (unsigned char)ptr[i];
+	  if (isalnum(c))
+		out += (char)toupper(c);
+	}
+	return out;
+}
+//---------------------------------------------------------------------------
+AnsiString __fastcall TForm1::NormalizeFlightNum(const AnsiString &value)
+{
+	return NormalizeCodeToken(value);
+}
+//---------------------------------------------------------------------------
+bool __fastcall TForm1::DequeueRouteFetch(AnsiString &flightNum)
+{
+	bool haveData = false;
+	RouteCacheCs->Acquire();
+	if (!RouteFetchQueue.empty())
+	{
+	  flightNum = RouteFetchQueue.front();
+	  RouteFetchQueue.pop_front();
+	  haveData = true;
+	}
+	RouteCacheCs->Release();
+	return haveData;
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::StoreRouteFetchResult(const AnsiString &flightNum,
+											  bool success,
+											  const AnsiString &routeText,
+											  const AnsiString &destCode,
+											  bool haveDestination,
+											  double destLat,
+											  double destLon)
+{
+	if (flightNum.IsEmpty()) return;
+
+	RouteCacheCs->Acquire();
+	TRouteCacheEntry &entry = RouteCache[flightNum];
+	entry.LastAttemptMs = GetCurrentTimeInMsec();
+
+	if (!success)
+	{
+	  entry.Status = RFS_FAILED;
+	  entry.RouteText = "";
+	  entry.DestCode = "";
+	  entry.HaveDestination = false;
+	  entry.DestLat = 0.0;
+	  entry.DestLon = 0.0;
+	}
+	else
+	{
+	  entry.Status = RFS_READY;
+	  entry.RouteText = routeText;
+	  entry.DestCode = destCode;
+	  entry.HaveDestination = haveDestination;
+	  if (haveDestination)
+	  {
+		entry.DestLat = destLat;
+		entry.DestLon = destLon;
+	  }
+	  else
+	  {
+		entry.DestLat = 0.0;
+		entry.DestLon = 0.0;
+	  }
+	}
+	RouteCacheCs->Release();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::EnqueueRouteFetch(const AnsiString &flightNum)
+{
+	AnsiString key = NormalizeFlightNum(flightNum);
+	if (key.IsEmpty()) return;
+
+	__int64 now = GetCurrentTimeInMsec();
+	bool alreadyQueued = false;
+
+	RouteCacheCs->Acquire();
+	TRouteCacheEntry &entry = RouteCache[key];
+	if (entry.Status == RFS_PENDING)
+	{
+	  RouteCacheCs->Release();
+	  return;
+	}
+	if (entry.Status == RFS_READY)
+	{
+	  RouteCacheCs->Release();
+	  return;
+	}
+	if ((entry.Status == RFS_FAILED) && ((now - entry.LastAttemptMs) < ROUTE_FETCH_RETRY_COOLDOWN_MS))
+	{
+	  RouteCacheCs->Release();
+	  return;
+	}
+	for (std::deque<AnsiString>::iterator it = RouteFetchQueue.begin(); it != RouteFetchQueue.end(); ++it)
+	{
+	  if (*it == key)
+	  {
+		alreadyQueued = true;
+		break;
+	  }
+	}
+	if (!alreadyQueued)
+	  RouteFetchQueue.push_back(key);
+
+	entry.Status = RFS_PENDING;
+	entry.LastAttemptMs = now;
+	RouteCacheCs->Release();
+}
+//---------------------------------------------------------------------------
+bool __fastcall TForm1::TryGetCachedRoute(const AnsiString &flightNum, TRouteCacheEntry &entry)
+{
+	AnsiString key = NormalizeFlightNum(flightNum);
+	if (key.IsEmpty()) return false;
+
+	bool haveRoute = false;
+	RouteCacheCs->Acquire();
+	std::map<AnsiString, TRouteCacheEntry>::iterator it = RouteCache.find(key);
+	if (it != RouteCache.end())
+	{
+	  entry = it->second;
+	  haveRoute = true;
+	}
+	RouteCacheCs->Release();
+	return haveRoute;
+}
+//---------------------------------------------------------------------------
+bool __fastcall TForm1::ParseDestinationCode(const AnsiString &routeText, AnsiString &destCode)
+{
+	destCode = "";
+	std::string route = routeText.c_str();
+	if (route.empty()) return false;
+
+	for (size_t i = 0; i < route.size(); i++)
+	{
+	  if (route[i] == '\r' || route[i] == '\n')
+		route[i] = ' ';
+	}
+
+	std::vector<std::string> tokens;
+	size_t start = 0;
+	while (true)
+	{
+	  size_t p = route.find('-', start);
+	  if (p == std::string::npos)
+	  {
+		tokens.push_back(route.substr(start));
+		break;
+	  }
+	  tokens.push_back(route.substr(start, p - start));
+	  start = p + 1;
+	}
+
+	for (int i = (int)tokens.size() - 1; i >= 0; i--)
+	{
+	  AnsiString normalized = NormalizeCodeToken(tokens[(size_t)i].c_str());
+	  if (!normalized.IsEmpty())
+	  {
+		destCode = normalized;
+		return true;
+	  }
+	}
+	return false;
+}
+//---------------------------------------------------------------------------
+bool __fastcall TForm1::BuildTrajectory(const TADS_B_Aircraft *data,
+										const TRouteCacheEntry *routeEntry,
+										std::vector<TGeoPoint> &outPoints,
+										bool &hasDestination)
+{
+	outPoints.clear();
+	hasDestination = false;
+
+	if (!data || !data->HaveLatLon || !data->HaveSpeedAndHeading || data->Speed <= 0.0)
+	  return false;
+
+	TGeoPoint p0;
+	p0.lat = data->Latitude;
+	p0.lon = data->Longitude;
+	outPoints.push_back(p0);
+
+	double simLat = data->Latitude;
+	double simLon = data->Longitude;
+	double simHdg = NormalizeHeading360(data->Heading);
+	const double stepNm1s = data->Speed * (TURN_DT_SECONDS / 3600.0);
+	if (stepNm1s <= 0.0)
+	  return false;
+
+	if (routeEntry && routeEntry->Status == RFS_READY && routeEntry->HaveDestination)
+	{
+	  hasDestination = true;
+
+	  for (int t = 0; (t < TURN_PHASE_MAX_SECONDS) && ((int)outPoints.size() < TRAJECTORY_MAX_POINTS); t++)
+	  {
+		double distNm = 0.0;
+		double bearing = 0.0;
+		double azBack = 0.0;
+		if (VInverse(simLat, simLon, routeEntry->DestLat, routeEntry->DestLon, &distNm, &bearing, &azBack) != OKNOERROR)
+		  break;
+
+		if (distNm <= ARRIVAL_THRESHOLD_NM)
+		{
+		  TGeoPoint pDest;
+		  pDest.lat = routeEntry->DestLat;
+		  pDest.lon = routeEntry->DestLon;
+		  outPoints.push_back(pDest);
+		  return outPoints.size() >= 2;
+		}
+
+		double err = NormalizeHeadingSignedDiff(bearing, simHdg);
+		if (fabs(err) <= HEADING_ALIGN_DEG)
+		{
+		  break;
+		}
+
+		double maxStep = TURN_RATE_DEG_PER_SEC * TURN_DT_SECONDS;
+		double delta = err;
+		if (delta > maxStep) delta = maxStep;
+		if (delta < -maxStep) delta = -maxStep;
+		simHdg = NormalizeHeading360(simHdg + delta);
+
+		double nextLat = 0.0;
+		double nextLon = 0.0;
+		double azTmp = 0.0;
+		if (VDirect(simLat, simLon, simHdg, stepNm1s, &nextLat, &nextLon, &azTmp) != OKNOERROR)
+		  break;
+
+		simLat = nextLat;
+		simLon = nextLon;
+		TGeoPoint p;
+		p.lat = simLat;
+		p.lon = simLon;
+		outPoints.push_back(p);
+	  }
+
+	  if ((int)outPoints.size() >= TRAJECTORY_MAX_POINTS)
+		return outPoints.size() >= 2;
+
+	  double remainNm = 0.0;
+	  double az12 = 0.0;
+	  double az21 = 0.0;
+	  if (VInverse(simLat, simLon, routeEntry->DestLat, routeEntry->DestLon, &remainNm, &az12, &az21) == OKNOERROR)
+	  {
+		if (remainNm <= ARRIVAL_THRESHOLD_NM)
+		{
+		  TGeoPoint pDest;
+		  pDest.lat = routeEntry->DestLat;
+		  pDest.lon = routeEntry->DestLon;
+		  outPoints.push_back(pDest);
+		  return outPoints.size() >= 2;
+		}
+
+		double stepNm = data->Speed * (TRAJECTORY_POINT_SPACING_SECONDS / 3600.0);
+		if (stepNm < 1.0) stepNm = 1.0;
+		int samples = (int)ceil(remainNm / stepNm);
+		if (samples < 1) samples = 1;
+
+		int remainingBudget = TRAJECTORY_MAX_POINTS - (int)outPoints.size();
+		if (remainingBudget <= 0)
+		  return outPoints.size() >= 2;
+		if (samples > remainingBudget)
+		  samples = remainingBudget;
+
+		for (int i = 1; i <= samples; i++)
+		{
+		  double along = remainNm * ((double)i / (double)samples);
+		  double lat2 = 0.0;
+		  double lon2 = 0.0;
+		  double az2 = 0.0;
+		  if (VDirect(simLat, simLon, az12, along, &lat2, &lon2, &az2) == OKNOERROR)
+		  {
+			TGeoPoint p;
+			p.lat = lat2;
+			p.lon = lon2;
+			outPoints.push_back(p);
+		  }
+		}
+
+		if (!outPoints.empty())
+		{
+		  outPoints.back().lat = routeEntry->DestLat;
+		  outPoints.back().lon = routeEntry->DestLon;
+		}
+	  }
+	  return outPoints.size() >= 2;
+	}
+
+	// Fallback trajectory with no destination: simulate forward for 60 seconds.
+	int fallbackSteps = (int)TRAJECTORY_LEAD_SECONDS;
+	for (int t = 0; (t < fallbackSteps) && ((int)outPoints.size() < TRAJECTORY_MAX_POINTS); t++)
+	{
+	  double nextLat = 0.0;
+	  double nextLon = 0.0;
+	  double azTmp = 0.0;
+	  if (VDirect(simLat, simLon, simHdg, stepNm1s, &nextLat, &nextLon, &azTmp) != OKNOERROR)
+		break;
+
+	  simLat = nextLat;
+	  simLon = nextLon;
+	  TGeoPoint p;
+	  p.lat = simLat;
+	  p.lon = simLon;
+	  outPoints.push_back(p);
+	}
+
+	return outPoints.size() >= 2;
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::DrawTrajectory(const std::vector<TGeoPoint> &points, bool hasDestination)
+{
+	if (points.size() < 2) return;
+
+	glPushAttrib(GL_ENABLE_BIT | GL_LINE_BIT | GL_POINT_BIT | GL_CURRENT_BIT);
+	glColor4f(1.0, 0.0, 0.0, 1.0);
+	glDisable(GL_LINE_STIPPLE);
+	glLineWidth(4.0);
+
+	bool stripOpen = false;
+	for (size_t i = 0; i < points.size(); i++)
+	{
+	  if ((i > 0) && (fabs(points[i - 1].lon - points[i].lon) > 180.0))
+	  {
+		if (stripOpen)
+		{
+		  glEnd();
+		  stripOpen = false;
+		}
+	  }
+
+	  if (!stripOpen)
+	  {
+		glBegin(GL_LINE_STRIP);
+		stripOpen = true;
+	  }
+
+	  double x = 0.0;
+	  double y = 0.0;
+	  LatLon2XY(points[i].lat, points[i].lon, x, y);
+	  glVertex2f(x, y);
+	}
+	if (stripOpen) glEnd();
+
+	if (hasDestination)
+	{
+	  const TGeoPoint &dest = points.back();
+	  double x = 0.0;
+	  double y = 0.0;
+	  LatLon2XY(dest.lat, dest.lon, x, y);
+
+	  glDisable(GL_LINE_STIPPLE);
+	  glLineWidth(3.0);
+	  const float radius = 8.0f;
+	  glBegin(GL_LINE_LOOP);
+	  for (int i = 0; i < 20; i++)
+	  {
+		float ang = (float)(2.0 * M_PI * (double)i / 20.0);
+		glVertex2f((float)x + cosf(ang) * radius, (float)y + sinf(ang) * radius);
+	  }
+	  glEnd();
+
+	  glBegin(GL_LINES);
+	  glVertex2f((float)x - radius, (float)y);
+	  glVertex2f((float)x + radius, (float)y);
+	  glVertex2f((float)x, (float)y - radius);
+	  glVertex2f((float)x, (float)y + radius);
+	  glEnd();
+	}
+	glPopAttrib();
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::ClearTrajectoryState()
+{
+	TrajectoryState.Valid = false;
+	TrajectoryState.ICAO = 0;
+	TrajectoryState.Points.clear();
+	TrajectoryState.LastLat = 0.0;
+	TrajectoryState.LastLon = 0.0;
+	TrajectoryState.LastHeading = 0.0;
+	TrajectoryState.LastSpeed = 0.0;
+	TrajectoryState.LastRouteKey = "";
+	TrajectoryState.HadDestination = false;
+	LastWeatherOverlaySignature = "";
+}
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------
 __fastcall TForm1::TForm1(TComponent* Owner)
@@ -238,8 +772,13 @@ __fastcall TForm1::TForm1(TComponent* Owner)
   InitDecodeRawADS_B();
   RecordRawStream=NULL;
   PlayBackRawStream=NULL;
+  RouteCacheCs = new System::Syncobjs::TCriticalSection();
+  RouteFetchThread = NULL;
+  LastWeatherOverlayPostMs = 0;
+  LastWeatherOverlaySignature = "";
   TrackHook.Valid_CC=false;
   TrackHook.Valid_CPA=false;
+  ClearTrajectoryState();
 
   HashTable = ght_create(50000);
 
@@ -267,12 +806,17 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  g_EarthView->m_Eye.h /= pow(1.3,18);//pow(1.3,43);
  SetMapCenter(g_EarthView->m_Eye.x, g_EarthView->m_Eye.y);
  TimeToGoTrackBar->Position=120;
- BigQueryCSV=NULL;
- BigQueryRowCount=0;
- BigQueryFileCount=0;
- InitAircraftDB(AircraftDBPathFileName);
- Form1->SpVoice1->Rate=2; // Set Rate of Voice
- Form1->SpVoice1->Volume=100;  //Set Volume of Voice
+  BigQueryCSV=NULL;
+  BigQueryRowCount=0;
+  BigQueryFileCount=0;
+  InitAircraftDB(AircraftDBPathFileName);
+  AirportLookupPathFileName=ExtractFilePath(ExtractFileDir(Application->ExeName)) +AnsiString("..\\AirportDB\\airport_lookup.csv");
+  if (!InitAirportLookup(AirportLookupPathFileName))
+  {
+	printf("Warning: Failed to load airport lookup file %s\n", AirportLookupPathFileName.c_str());
+  }
+  Form1->SpVoice1->Rate=2; // Set Rate of Voice
+  Form1->SpVoice1->Volume=100;  //Set Volume of Voice
  
  NetHTTPClientPrediction= new TNetHTTPClient(this);
  NetHTTPClientPrediction->OnRequestCompleted=NetHTTPClientPredictionRequestCompleted;
@@ -301,15 +845,31 @@ __fastcall TForm1::TForm1(TComponent* Owner)
        c->Top += delta;
      }
    }
- }
+	 }
 
- printf("init complete\n");
+	 RouteFetchThread = new TRouteFetchThread(true);
+	 RouteFetchThread->FreeOnTerminate = false;
+	 RouteFetchThread->Resume();
+
+	 printf("init complete\n");
 }
 //---------------------------------------------------------------------------
 __fastcall TForm1::~TForm1()
 {
  Timer1->Enabled=false;
  Timer2->Enabled=false;
+ if (RouteFetchThread)
+ {
+   RouteFetchThread->Terminate();
+   RouteFetchThread->WaitFor();
+   delete RouteFetchThread;
+   RouteFetchThread = NULL;
+ }
+ if (RouteCacheCs)
+ {
+   delete RouteCacheCs;
+   RouteCacheCs = NULL;
+ }
  delete g_EarthView;
  if (g_GETileManager) delete g_GETileManager;
  delete g_MasterLayer;
@@ -570,41 +1130,74 @@ void __fastcall TForm1::DrawObjects(void)
  ViewableAircraftCountLabel->Caption=ViewableAircraft;
  if (TrackHook.Valid_CC)
  {
-
 		Data= (TADS_B_Aircraft *)ght_get(HashTable, sizeof(TrackHook.ICAO_CC), (void *)&TrackHook.ICAO_CC);
 		if (Data)
 		{
+		TRouteCacheEntry routeEntry;
+		bool haveRouteEntry = false;
+		bool routeReady = false;
+		AnsiString routeStateKey = "LEAD_ONLY";
+
 		ICAOLabel->Caption=Data->HexAddr;
 		if (Data->HaveFlightNum)
 		  {
-           FlightNumLabel->Caption=Data->FlightNum;
-           if (Data->RequestedRoute==false)
-           {
-             _di_IHTTPResponse Repsonse;
-             char _GetStr[1024];
-             Data->RequestedRoute=true;
-		     snprintf (_GetStr, sizeof(_GetStr), API_SERVICE_URL_TXT, Data->FlightNum, Data->FlightNum);
-             //printf("%s\n", _GetStr);
-             Repsonse=NetHTTPClientRoute->Get(AnsiString(_GetStr));
-             if (Repsonse->StatusCode==200)
-             {
-              AnsiString Route=Repsonse->ContentAsString(TEncoding::ASCII);
-              if (strlen(Route.c_str())<sizeof(Data->Route))
-              {
-               strcpy(Data->Route,Route.c_str());
-               Data->HaveRoute=true;
-              }
-             }
-            // else  printf("No Route Error\n");
-           }
-           if (Data->HaveRoute)
-           {
-              RouteLabel->Caption=Data->Route;
-           }
-           else RouteLabel->Caption="UNKNOWN";
-
+		   FlightNumLabel->Caption=Data->FlightNum;
+		   AnsiString flightNum = NormalizeFlightNum(Data->FlightNum);
+		   if (!flightNum.IsEmpty())
+		   {
+			 haveRouteEntry = TryGetCachedRoute(flightNum, routeEntry);
+			 if (!haveRouteEntry)
+			 {
+			   Data->HaveRoute = false;
+			   EnqueueRouteFetch(flightNum);
+			   RouteLabel->Caption="LOADING";
+			 }
+			 else
+			 {
+			   if (routeEntry.Status == RFS_READY)
+			   {
+				 routeReady = true;
+				 Data->HaveRoute = false;
+				 if (strlen(routeEntry.RouteText.c_str()) < sizeof(Data->Route))
+				 {
+				   strcpy(Data->Route, routeEntry.RouteText.c_str());
+				   Data->HaveRoute = true;
+				 }
+				 RouteLabel->Caption = routeEntry.RouteText;
+				 routeStateKey = routeEntry.RouteText + "|" + routeEntry.DestCode;
+			   }
+			   else if (routeEntry.Status == RFS_PENDING)
+			   {
+				 Data->HaveRoute = false;
+				 RouteLabel->Caption="LOADING";
+			   }
+			   else if (routeEntry.Status == RFS_FAILED)
+			   {
+				 Data->HaveRoute = false;
+				 RouteLabel->Caption="UNKNOWN";
+				 if ((GetCurrentTimeInMsec() - routeEntry.LastAttemptMs) >= ROUTE_FETCH_RETRY_COOLDOWN_MS)
+				   EnqueueRouteFetch(flightNum);
+			   }
+			   else
+			   {
+				 Data->HaveRoute = false;
+				 EnqueueRouteFetch(flightNum);
+				 RouteLabel->Caption="LOADING";
+			   }
+			 }
+		   }
+		   else
+		   {
+			 Data->HaveRoute = false;
+			 RouteLabel->Caption="UNKNOWN";
+		   }
 		  }
-		else FlightNumLabel->Caption="N/A";
+		else
+		{
+		  FlightNumLabel->Caption="N/A";
+		  Data->HaveRoute = false;
+		  RouteLabel->Caption="N/A";
+		}
         if (Data->HaveLatLon)
 		{
 		 CLatLabel->Caption=DMS::DegreesMinutesSecondsLat(Data->Latitude).c_str();
@@ -635,13 +1228,60 @@ void __fastcall TForm1::DrawObjects(void)
         glColor4f(1.0, 0.0, 0.0, 1.0);
         LatLon2XY(Data->Latitude,Data->Longitude, ScrX, ScrY);
         DrawTrackHook(ScrX, ScrY);
+
+		if (Data->HaveLatLon && Data->HaveSpeedAndHeading && (Data->Speed > 0.0))
+		{
+		  bool trajectoryChanged = (!TrajectoryState.Valid) ||
+								   (TrajectoryState.ICAO != Data->ICAO) ||
+								   (fabs(TrajectoryState.LastLat - Data->Latitude) > 0.000001) ||
+								   (fabs(TrajectoryState.LastLon - Data->Longitude) > 0.000001) ||
+								   (fabs(TrajectoryState.LastHeading - Data->Heading) > 0.000001) ||
+								   (fabs(TrajectoryState.LastSpeed - Data->Speed) > 0.000001) ||
+								   (TrajectoryState.LastRouteKey != routeStateKey);
+		  if (trajectoryChanged)
+		  {
+			std::vector<TGeoPoint> points;
+			bool hasDestination = false;
+			const TRouteCacheEntry *routePtr = routeReady ? &routeEntry : NULL;
+
+			if (BuildTrajectory(Data, routePtr, points, hasDestination))
+			{
+			  TrajectoryState.Valid = true;
+			  TrajectoryState.ICAO = Data->ICAO;
+			  TrajectoryState.Points = points;
+			  TrajectoryState.LastLat = Data->Latitude;
+			  TrajectoryState.LastLon = Data->Longitude;
+			  TrajectoryState.LastHeading = Data->Heading;
+			  TrajectoryState.LastSpeed = Data->Speed;
+			  TrajectoryState.LastRouteKey = routeStateKey;
+			  TrajectoryState.HadDestination = hasDestination;
+
+			  const AnsiString signature = BuildTrajectorySignature(TrajectoryState.Points);
+			  const __int64 nowMs = GetCurrentTimeInMsec();
+			  if (!signature.IsEmpty() &&
+				  (signature != LastWeatherOverlaySignature) &&
+				  ((LastWeatherOverlayPostMs == 0) || ((nowMs - LastWeatherOverlayPostMs) >= WEATHER_POST_THROTTLE_MS)))
+			  {
+				SendPredictedRoutePointsToBackendFromPoints(TrajectoryState.Points);
+				LastWeatherOverlayPostMs = nowMs;
+				LastWeatherOverlaySignature = signature;
+			  }
+			}
+			else ClearTrajectoryState();
+		  }
+		  if (TrajectoryState.Valid)
+			DrawTrajectory(TrajectoryState.Points, TrajectoryState.HadDestination);
+		}
+		else ClearTrajectoryState();
         }
 
 		else
         {
 		 TrackHook.Valid_CC=false;
+		 ClearTrajectoryState();
 		 ICAOLabel->Caption="N/A";
 		 FlightNumLabel->Caption="N/A";
+		 RouteLabel->Caption="N/A";
          CLatLabel->Caption="N/A";
 		 CLonLabel->Caption="N/A";
          SpdLabel->Caption="N/A";
@@ -650,6 +1290,11 @@ void __fastcall TForm1::DrawObjects(void)
 		 MsgCntLabel->Caption="N/A";
          TrkLastUpdateTimeLabel->Caption="N/A";
         }
+ }
+ else
+ {
+   ClearTrajectoryState();
+   RouteLabel->Caption="N/A";
  }
  if (TrackHook.Valid_CPA)
  {
@@ -827,17 +1472,10 @@ wchar_t *str = new wchar_t[Str.WideCharBufSize()];
 return Str.WideChar(str, Str.WideCharBufSize());
 }
 //---------------------------------------------------------------------------
-AnsiString __fastcall TForm1::BuildPredictedRoutePointsJson(TADS_B_Aircraft *Data)
+AnsiString __fastcall TForm1::BuildPredictedRoutePointsJsonFromPoints(const std::vector<TGeoPoint> &pointsIn)
 {
- if (!Data) return "";
- if (!Data->HaveLatLon || !Data->HaveSpeedAndHeading) return "";
- if (TimeToGoCheckBox->State != cbChecked) return "";
+ if (pointsIn.size() < 2) return "";
 
- // Keep trajectory generation consistent with the yellow prediction line.
- const double totalDistanceNm = Data->Speed / 3060.0 * TimeToGoTrackBar->Position;
- if (totalDistanceNm <= 0.0) return "";
-
- const int sampleCount = 20; // start + 20 intermediates + end
  TFormatSettings fs = TFormatSettings::Create();
  fs.DecimalSeparator = '.';
  double prevLat = 1000.0;
@@ -846,22 +1484,13 @@ AnsiString __fastcall TForm1::BuildPredictedRoutePointsJson(TADS_B_Aircraft *Dat
  int uniqueCount = 0;
 
  AnsiString points = "";
- for (int i = 0; i <= sampleCount; i++)
+ for (size_t i = 0; i < pointsIn.size(); i++)
  {
-   const double frac = (double)i / (double)sampleCount;
-   const double d = totalDistanceNm * frac;
+   double lat = round(pointsIn[i].lat * 100.0) / 100.0;
+   double lon = round(pointsIn[i].lon * 100.0) / 100.0;
 
-   double lat = 0.0, lon = 0.0, az = 0.0;
-   if (VDirect(Data->Latitude, Data->Longitude, Data->Heading, d, &lat, &lon, &az) != OKNOERROR)
-     continue;
-
-   // Round to 2 decimals as requested.
-   lat = round(lat * 100.0) / 100.0;
-   lon = round(lon * 100.0) / 100.0;
-
-   // De-duplicate consecutive rounded points.
    if (havePoint && fabs(lat - prevLat) < 0.000001 && fabs(lon - prevLon) < 0.000001)
-     continue;
+	 continue;
 
    if (points.Length() > 0) points += ",";
    points += "{\"lat\":" + FloatToStrF(lat, ffFixed, 12, 2, fs) + ",\"lon\":" + FloatToStrF(lon, ffFixed, 12, 2, fs) + "}";
@@ -903,9 +1532,9 @@ AnsiString __fastcall TForm1::BuildPredictedRoutePointsJson(TADS_B_Aircraft *Dat
  return json;
 }
 //---------------------------------------------------------------------------
-void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
+void __fastcall TForm1::SendPredictedRoutePointsToBackendFromPoints(const std::vector<TGeoPoint> &points)
 {
- AnsiString payload = BuildPredictedRoutePointsJson(Data);
+ AnsiString payload = BuildPredictedRoutePointsJsonFromPoints(points);
  if (payload.IsEmpty()) return;
 
  TStringStream *body = NULL;
@@ -914,13 +1543,13 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
   body = new TStringStream((UnicodeString)payload, TEncoding::UTF8, false);
   System::Net::Urlclient::TNetHeaders headers;
   headers.Length = 1;
-   headers[0] = System::Net::Urlclient::TNameValuePair("Content-Type", "application/json");
+  headers[0] = System::Net::Urlclient::TNameValuePair("Content-Type", "application/json");
 
   _di_IHTTPResponse response = NetHTTPClientWeather->Post(AnsiString(WEATHER_OVERLAY_URL), body, NULL, headers);
   if (!response || (response->StatusCode < 200 || response->StatusCode >= 300))
   {
-    // Non-fatal: weather overlay is optional.
-    return;
+	// Non-fatal: weather overlay is optional.
+	return;
   }
 
   UnicodeString content = response->ContentAsString(TEncoding::UTF8);
@@ -935,14 +1564,14 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
   fs.DecimalSeparator = '.';
   if (cellDegValue)
   {
-    try
-    {
-      g_RiskOverlayCellDeg = StrToFloat((UnicodeString)cellDegValue->Value(), fs);
-    }
-    catch(...)
-    {
-      g_RiskOverlayCellDeg = 0.01;
-    }
+	try
+	{
+	  g_RiskOverlayCellDeg = StrToFloat((UnicodeString)cellDegValue->Value(), fs);
+	}
+	catch(...)
+	{
+	  g_RiskOverlayCellDeg = 0.01;
+	}
   }
 
   TJSONValue *cellsValue = obj->GetValue("cells");
@@ -952,26 +1581,26 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
   g_RiskOverlayCells.clear();
   for (int i = 0; i < cells->Count; i++)
   {
-    TJSONObject *cellObj = dynamic_cast<TJSONObject *>(cells->Items[i]);
-    if (!cellObj) continue;
+	TJSONObject *cellObj = dynamic_cast<TJSONObject *>(cells->Items[i]);
+	if (!cellObj) continue;
 
-    TJSONValue *latValue = cellObj->GetValue("cell_lat");
-    TJSONValue *lonValue = cellObj->GetValue("cell_lon");
-    TJSONValue *riskValue = cellObj->GetValue("risk_score");
-    if (!latValue || !lonValue || !riskValue) continue;
+	TJSONValue *latValue = cellObj->GetValue("cell_lat");
+	TJSONValue *lonValue = cellObj->GetValue("cell_lon");
+	TJSONValue *riskValue = cellObj->GetValue("risk_score");
+	if (!latValue || !lonValue || !riskValue) continue;
 
-    TRiskOverlayCell c;
-    try
-    {
-      c.lat = StrToFloat((UnicodeString)latValue->Value(), fs);
-      c.lon = StrToFloat((UnicodeString)lonValue->Value(), fs);
-      c.risk = StrToFloat((UnicodeString)riskValue->Value(), fs);
-      g_RiskOverlayCells.push_back(c);
-    }
-    catch(...)
-    {
-      continue;
-    }
+	TRiskOverlayCell c;
+	try
+	{
+	  c.lat = StrToFloat((UnicodeString)latValue->Value(), fs);
+	  c.lon = StrToFloat((UnicodeString)lonValue->Value(), fs);
+	  c.risk = StrToFloat((UnicodeString)riskValue->Value(), fs);
+	  g_RiskOverlayCells.push_back(c);
+	}
+	catch(...)
+	{
+	  continue;
+	}
   }
 
   g_HaveRiskOverlay = !g_RiskOverlayCells.empty();
@@ -982,6 +1611,37 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
  }
 
  if (body) delete body;
+}
+//---------------------------------------------------------------------------
+AnsiString __fastcall TForm1::BuildPredictedRoutePointsJson(TADS_B_Aircraft *Data)
+{
+ if (!Data) return "";
+
+ if (TrajectoryState.Valid && (TrajectoryState.ICAO == Data->ICAO) && !TrajectoryState.Points.empty())
+   return BuildPredictedRoutePointsJsonFromPoints(TrajectoryState.Points);
+
+ std::vector<TGeoPoint> fallbackPoints;
+ bool hadDestination = false;
+ if (BuildTrajectory(Data, NULL, fallbackPoints, hadDestination))
+   return BuildPredictedRoutePointsJsonFromPoints(fallbackPoints);
+
+ return "";
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
+{
+ if (!Data) return;
+
+ if (TrajectoryState.Valid && (TrajectoryState.ICAO == Data->ICAO) && !TrajectoryState.Points.empty())
+ {
+   SendPredictedRoutePointsToBackendFromPoints(TrajectoryState.Points);
+   return;
+ }
+
+ std::vector<TGeoPoint> fallbackPoints;
+ bool hadDestination = false;
+ if (BuildTrajectory(Data, NULL, fallbackPoints, hadDestination))
+   SendPredictedRoutePointsToBackendFromPoints(fallbackPoints);
 }
 //---------------------------------------------------------------------------
  void __fastcall TForm1::HookTrack(int X, int Y,bool CPA_Hook)
@@ -1028,12 +1688,14 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
 					&Current_ICAO);
 	  if (ADS_B_Aircraft)
 	  {
-		if (!CPA_Hook)
-		{
+			if (!CPA_Hook)
+			{
          AnsiString Text="Hooked Aircraft "+(AnsiString)GetAircraftDBInfo(ADS_B_Aircraft->ICAO) ;
          wchar_t *wtext= AnsiTowchar_t(Text);
-		 TrackHook.Valid_CC=true;
-		 TrackHook.ICAO_CC=ADS_B_Aircraft->ICAO;
+			 if ((!TrackHook.Valid_CC) || (TrackHook.ICAO_CC != ADS_B_Aircraft->ICAO))
+			   ClearTrajectoryState();
+			 TrackHook.Valid_CC=true;
+			 TrackHook.ICAO_CC=ADS_B_Aircraft->ICAO;
 		 printf("%s\n\n",GetAircraftDBInfo(ADS_B_Aircraft->ICAO));
          Form1->SpVoice1->Speak(wtext, SpeechVoiceSpeakFlags::SVSFlagsAsync );  // Say Text and continue
          delete wtext;
@@ -1048,9 +1710,6 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
          {
              PhaseLabel->Caption="Phase: N/A";
          }
-
-         // Send rounded intermediate points for weather overlay analysis.
-         SendPredictedRoutePointsToBackend(ADS_B_Aircraft);
 		}
 		else
 		{
@@ -1063,12 +1722,14 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
 	}
 	else
 		{
-		 if (!CPA_Hook)
-		  {
-		   TrackHook.Valid_CC=false;
-           ICAOLabel->Caption="N/A";
-		   FlightNumLabel->Caption="N/A";
-		   CLatLabel->Caption="N/A";
+			 if (!CPA_Hook)
+			  {
+			   TrackHook.Valid_CC=false;
+	           ClearTrajectoryState();
+	           ICAOLabel->Caption="N/A";
+			   FlightNumLabel->Caption="N/A";
+			   RouteLabel->Caption="N/A";
+			   CLatLabel->Caption="N/A";
 		   CLonLabel->Caption="N/A";
 		   SpdLabel->Caption="N/A";
 		   HdgLabel->Caption="N/A";

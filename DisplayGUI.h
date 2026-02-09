@@ -28,8 +28,12 @@
 #include <System.Net.HttpClient.hpp>
 #include <System.Net.HttpClientComponent.hpp>
 #include <System.Net.URLClient.hpp>
+#include <System.SyncObjs.hpp>
 #include "SpeechLib_OCX.h"
 #include <Vcl.OleServer.hpp>
+#include <deque>
+#include <map>
+#include <vector>
 
 typedef float T_GL_Color[4];
 
@@ -48,6 +52,44 @@ typedef struct
  double lon;
  double hae;
 }TPolyLine;
+
+typedef struct
+{
+ double lat;
+ double lon;
+}TGeoPoint;
+
+typedef enum
+{
+ RFS_NONE=0,
+ RFS_PENDING,
+ RFS_READY,
+ RFS_FAILED
+}TRouteFetchStatus;
+
+typedef struct
+{
+ TRouteFetchStatus Status;
+ AnsiString RouteText;
+ AnsiString DestCode;
+ bool HaveDestination;
+ double DestLat;
+ double DestLon;
+ __int64 LastAttemptMs;
+}TRouteCacheEntry;
+
+typedef struct
+{
+ bool Valid;
+ uint32_t ICAO;
+ std::vector<TGeoPoint> Points;
+ double LastLat;
+ double LastLon;
+ double LastHeading;
+ double LastSpeed;
+ AnsiString LastRouteKey;
+ bool HadDestination;
+}TTrajectoryState;
 
 
 #define MAX_AREA_POINTS 500
@@ -95,6 +137,19 @@ public:
 	 __int64 LastTime;
 	__fastcall TTCPClientSBSHandleThread(bool value);
 	~TTCPClientSBSHandleThread();
+};
+//---------------------------------------------------------------------------
+//---------------------------------------------------------------------------
+class TRouteFetchThread : public TThread
+{
+private:
+	AnsiString FlightNum;
+	void __fastcall DoFetch(void);
+protected:
+	void __fastcall Execute(void);
+public:
+	__fastcall TRouteFetchThread(bool value);
+	~TRouteFetchThread();
 };
 //---------------------------------------------------------------------------
 //---------------------------------------------------------------------------
@@ -238,14 +293,24 @@ __published:	// IDE-managed Components
           ISpeechRecoResult *Result);
 	void __fastcall LIstenClick(TObject *Sender);
     void __fastcall NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
-    void __fastcall NetHTTPClientPredictionRequestError(TObject *Sender, const UnicodeString AError);
+	void __fastcall NetHTTPClientPredictionRequestError(TObject *Sender, const UnicodeString AError);
     void __fastcall NetHTTPClientWeatherRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
     void __fastcall NetHTTPClientWeatherRequestError(TObject *Sender, const UnicodeString AError);
 
-private:	// User declarations
+	private:	// User declarations
+	friend class TRouteFetchThread;
+	AnsiString __fastcall NormalizeCodeToken(const AnsiString &value);
+	AnsiString __fastcall NormalizeFlightNum(const AnsiString &value);
+	bool __fastcall DequeueRouteFetch(AnsiString &flightNum);
+	void __fastcall StoreRouteFetchResult(const AnsiString &flightNum,
+										  bool success,
+										  const AnsiString &routeText,
+										  const AnsiString &destCode,
+										  bool haveDestination,
+										  double destLat,
+										  double destLon);
 
-
-public:		// User declarations
+	public:		// User declarations
 	__fastcall TForm1(TComponent* Owner);
 	__fastcall ~TForm1();
 	void __fastcall LatLon2XY(double lat,double lon, double &x, double &y);
@@ -258,11 +323,20 @@ public:		// User declarations
 	void __fastcall RegisterWithCoTRouter(void);
     void __fastcall SetMapCenter(double &x, double &y);
     void __fastcall LoadMap(int Type);
-    void __fastcall CreateBigQueryCSV(void);
-    void __fastcall CloseBigQueryCSV(void);
-    bool __fastcall LoadARTCCBoundaries(AnsiString FileName);
-    AnsiString __fastcall BuildPredictedRoutePointsJson(TADS_B_Aircraft *Data);
-    void __fastcall SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data);
+	void __fastcall CreateBigQueryCSV(void);
+	void __fastcall CloseBigQueryCSV(void);
+	bool __fastcall LoadARTCCBoundaries(AnsiString FileName);
+	void __fastcall EnqueueRouteFetch(const AnsiString &flightNum);
+	bool __fastcall TryGetCachedRoute(const AnsiString &flightNum, TRouteCacheEntry &entry);
+	bool __fastcall ParseDestinationCode(const AnsiString &routeText, AnsiString &destCode);
+	bool __fastcall BuildTrajectory(const TADS_B_Aircraft *data, const TRouteCacheEntry *routeEntry,
+									 std::vector<TGeoPoint> &outPoints, bool &hasDestination);
+	void __fastcall DrawTrajectory(const std::vector<TGeoPoint> &points, bool hasDestination);
+	void __fastcall ClearTrajectoryState();
+	AnsiString __fastcall BuildPredictedRoutePointsJsonFromPoints(const std::vector<TGeoPoint> &points);
+	void __fastcall SendPredictedRoutePointsToBackendFromPoints(const std::vector<TGeoPoint> &points);
+	AnsiString __fastcall BuildPredictedRoutePointsJson(TADS_B_Aircraft *Data);
+	void __fastcall SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data);
 
     TLabel                     *PhaseLabel;
     TNetHTTPClient             *NetHTTPClientPrediction;
@@ -304,6 +378,14 @@ public:		// User declarations
 	int                        CurrentSpriteImage;
     AnsiString                 AircraftDBPathFileName;
     AnsiString                 ARTCCBoundaryDataPathFileName;
+	AnsiString                 AirportLookupPathFileName;
+	std::map<AnsiString, TRouteCacheEntry> RouteCache;
+	std::deque<AnsiString>     RouteFetchQueue;
+	System::Syncobjs::TCriticalSection *RouteCacheCs;
+	TRouteFetchThread         *RouteFetchThread;
+	TTrajectoryState           TrajectoryState;
+	__int64                    LastWeatherOverlayPostMs;
+	AnsiString                 LastWeatherOverlaySignature;
 };
 //---------------------------------------------------------------------------
 extern PACKAGE TForm1 *Form1;
