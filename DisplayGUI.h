@@ -334,6 +334,8 @@ __published:	// IDE-managed Components
 	void __fastcall NetHTTPClientPredictionRequestError(TObject *Sender, const UnicodeString AError);
     void __fastcall NetHTTPClientWeatherRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
     void __fastcall NetHTTPClientWeatherRequestError(TObject *Sender, const UnicodeString AError);
+    void __fastcall NetHTTPClientFuelRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
+	void __fastcall NetHTTPClientFuelRequestError(TObject *Sender, const UnicodeString AError);
 
 	private:	// User declarations
 	friend class TRouteFetchThread;
@@ -368,6 +370,7 @@ __published:	// IDE-managed Components
 									   double co2BestKg,
 									   double co2GeodesicKg,
 									   double co2ReductionKg);
+	void __fastcall RequestFuelSummary(const AnsiString &icaoHex, const AnsiString &flightId, const AnsiString &phase);
 
 	public:		// User declarations
 	__fastcall TForm1(TComponent* Owner);
@@ -401,8 +404,12 @@ __published:	// IDE-managed Components
 
     TLabel                     *PhaseLabel;
 	TLabel                     *Co2Label;
+	TLabel                     *FuelRateLabel;
+	TLabel                     *FuelUsedLabel;
+	TLabel                     *FuelCo2Label;
     TNetHTTPClient             *NetHTTPClientPrediction;
     TNetHTTPClient             *NetHTTPClientWeather;
+	TNetHTTPClient             *NetHTTPClientFuel;
     ISpeechRecoGrammar         *SRGrammar;
 	int                        MouseDownX,MouseDownY;
 	bool                       MouseDown;
@@ -454,6 +461,9 @@ __published:	// IDE-managed Components
 	AnsiString                 LastWeatherOverlaySignature;
 	__int64                    LastCO2RecommendPostMs;
 	AnsiString                 LastCO2RecommendSignature;
+	__int64                    LastFuelSummaryPostMs;
+	AnsiString                 LastFuelSummarySignature;
+	AnsiString                 LastFuelSummaryPhase;
 	TForm                     *SpeechPopup;
 	TButton                   *SpeechToggleButton;
 	TLabel                    *SpeechPopupStatusLabel;

@@ -42,6 +42,7 @@
 #define API_SERVICE_URL_TXT  "https://vrs-standing-data.adsb.lol/routes/%.2s/%s.txt"
 #define WEATHER_OVERLAY_URL "http://localhost:8001/weather/overlay"
 #define CO2_RECOMMEND_URL "http://localhost:8001/co2/recommend"
+#define FUEL_SUMMARY_URL "http://localhost:8001/fuel/summary"
 #define MAP_CENTER_LAT  40.73612;
 #define MAP_CENTER_LON -80.33158;
 
@@ -61,6 +62,7 @@
 #define ARRIVAL_THRESHOLD_NM 0.5
 #define WEATHER_POST_THROTTLE_MS 2000
 #define CO2_RECOMMEND_THROTTLE_MS 10000
+#define FUEL_SUMMARY_THROTTLE_MS 15000
 
 
 #define BG_INTENSITY   0.37
@@ -1056,6 +1058,9 @@ __fastcall TForm1::TForm1(TComponent* Owner)
   LastWeatherOverlaySignature = "";
 	LastCO2RecommendPostMs = 0;
 	LastCO2RecommendSignature = "";
+	LastFuelSummaryPostMs = 0;
+	LastFuelSummarySignature = "";
+	LastFuelSummaryPhase = "";
   TrackHook.Valid_CC=false;
   TrackHook.Valid_CPA=false;
   ClearTrajectoryState();
@@ -1104,6 +1109,9 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  NetHTTPClientWeather= new TNetHTTPClient(this);
  NetHTTPClientWeather->OnRequestCompleted=NetHTTPClientWeatherRequestCompleted;
  NetHTTPClientWeather->OnRequestError=NetHTTPClientWeatherRequestError;
+ NetHTTPClientFuel = new TNetHTTPClient(this);
+ NetHTTPClientFuel->OnRequestCompleted = NetHTTPClientFuelRequestCompleted;
+ NetHTTPClientFuel->OnRequestError = NetHTTPClientFuelRequestError;
 
  PhaseLabel= new TLabel(Panel4);
  PhaseLabel->Parent=Panel4;
@@ -1123,9 +1131,36 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  Co2Label->AutoSize=true;
  Co2Label->BringToFront();
 
+ FuelRateLabel= new TLabel(Panel4);
+ FuelRateLabel->Parent=Panel4;
+ FuelRateLabel->Left=5;
+ FuelRateLabel->Top=Co2Label->Top + Co2Label->Height + 4;
+ FuelRateLabel->Caption="Fuel rate: N/A";
+ FuelRateLabel->Font->Assign(RouteLabel->Font);
+ FuelRateLabel->AutoSize=true;
+ FuelRateLabel->BringToFront();
+
+ FuelUsedLabel= new TLabel(Panel4);
+ FuelUsedLabel->Parent=Panel4;
+ FuelUsedLabel->Left=5;
+ FuelUsedLabel->Top=FuelRateLabel->Top + FuelRateLabel->Height + 4;
+ FuelUsedLabel->Caption="Fuel used: N/A";
+ FuelUsedLabel->Font->Assign(RouteLabel->Font);
+ FuelUsedLabel->AutoSize=true;
+ FuelUsedLabel->BringToFront();
+
+ FuelCo2Label= new TLabel(Panel4);
+ FuelCo2Label->Parent=Panel4;
+ FuelCo2Label->Left=5;
+ FuelCo2Label->Top=FuelUsedLabel->Top + FuelUsedLabel->Height + 4;
+ FuelCo2Label->Caption="CO2 emitted: N/A";
+ FuelCo2Label->Font->Assign(RouteLabel->Font);
+ FuelCo2Label->AutoSize=true;
+ FuelCo2Label->BringToFront();
+
  // Make room for phase line under ROUTE in the Close Control panel.
  {
-	const int delta = 44;
+	const int delta = 110;
    const int panel4Bottom = Panel4->Top + Panel4->Height;
    Panel4->Height += delta;
    for (int i = 0; i < Panel3->ControlCount; i++) {
@@ -1672,6 +1707,9 @@ void __fastcall TForm1::DrawObjects(void)
    ClearTrajectoryState();
    RouteLabel->Caption="N/A";
 	 if (Co2Label) Co2Label->Caption = "CO2 Saved: N/A";
+	 if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+	 if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+	 if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
  }
  if (TrackHook.Valid_CPA)
  {
@@ -2021,6 +2059,47 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
    SendPredictedRoutePointsToBackendFromPoints(fallbackPoints);
 }
 //---------------------------------------------------------------------------
+void __fastcall TForm1::RequestFuelSummary(const AnsiString &icaoHex, const AnsiString &flightId, const AnsiString &phase)
+{
+ if (!NetHTTPClientFuel) return;
+ if (icaoHex.IsEmpty()) return;
+
+ AnsiString flightKey = NormalizeFlightNum(flightId);
+ AnsiString signature = icaoHex + "|" + flightKey;
+ __int64 nowMs = GetCurrentTimeInMsec();
+ const bool allowByThrottle = (LastFuelSummaryPostMs == 0) ||
+   ((nowMs - LastFuelSummaryPostMs) >= FUEL_SUMMARY_THROTTLE_MS);
+ const bool signatureChanged = (signature != LastFuelSummarySignature);
+ const bool phaseChanged = (!phase.IsEmpty() && (phase != LastFuelSummaryPhase));
+
+ if (!signatureChanged && !phaseChanged && !allowByThrottle)
+   return;
+
+ AnsiString url = FUEL_SUMMARY_URL;
+ url += "?icao=" + icaoHex;
+ if (!flightKey.IsEmpty())
+   url += "&flight_id=" + flightKey;
+ if (!phase.IsEmpty())
+   url += "&phase=" + phase;
+
+ try {
+   if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: Loading...";
+   if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: Loading...";
+   if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: Loading...";
+   NetHTTPClientFuel->Get(url);
+   LastFuelSummaryPostMs = nowMs;
+   LastFuelSummarySignature = signature;
+   if (!phase.IsEmpty())
+	 LastFuelSummaryPhase = phase;
+ }
+ catch(...)
+ {
+   if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+   if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+   if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
+ }
+}
+//---------------------------------------------------------------------------
  void __fastcall TForm1::HookTrack(int X, int Y,bool CPA_Hook)
  {
   double VLat,VLon, dlat,dlon,Range;
@@ -2082,10 +2161,14 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
            AnsiString Url="http://localhost:8001/predict/"+(AnsiString)ADS_B_Aircraft->HexAddr;
            PhaseLabel->Caption="Phase: Loading...";
            NetHTTPClientPrediction->Get(Url);
+          RequestFuelSummary(ADS_B_Aircraft->HexAddr, ADS_B_Aircraft->FlightNum, "");
          }
          catch(...)
          {
              PhaseLabel->Caption="Phase: N/A";
+            if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+            if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+            if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
          }
 		}
 		else
@@ -2115,6 +2198,9 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
          TrkLastUpdateTimeLabel->Caption="N/A";
            PhaseLabel->Caption="Phase: N/A";
 			 if (Co2Label) Co2Label->Caption = "CO2 Saved: N/A";
+			 if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+			 if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+			 if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
            g_RiskOverlayCells.clear();
            g_HaveRiskOverlay=false;
 		  }
@@ -3952,6 +4038,7 @@ void __fastcall TForm1::NetHTTPClientPredictionRequestCompleted(TObject *Sender,
             phase[i] = '\0';
             
             PhaseLabel->Caption = "Phase: " + (AnsiString)phase;
+			RequestFuelSummary(ICAOLabel->Caption, FlightNumLabel->Caption, (AnsiString)phase);
         }
         else
         {
@@ -3977,5 +4064,73 @@ void __fastcall TForm1::NetHTTPClientWeatherRequestCompleted(TObject *Sender, _d
 void __fastcall TForm1::NetHTTPClientWeatherRequestError(TObject *Sender, const UnicodeString AError)
 {
     // Non-fatal: weather overlay should not affect phase UI.
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::NetHTTPClientFuelRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse)
+{
+	if (!AResponse || (AResponse->StatusCode < 200 || AResponse->StatusCode >= 300))
+	{
+		if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+		if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+		if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
+		return;
+	}
+
+	UnicodeString content = AResponse->ContentAsString(TEncoding::UTF8);
+	std::unique_ptr<TJSONValue> root(TJSONObject::ParseJSONValue(content));
+	if (!root)
+	{
+		if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+		if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+		if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
+		return;
+	}
+	TJSONObject *obj = dynamic_cast<TJSONObject *>(root.get());
+	if (!obj) return;
+
+	TFormatSettings fs = TFormatSettings::Create();
+	fs.DecimalSeparator = '.';
+
+	double rate = 0.0;
+	double fuel = 0.0;
+	double co2 = 0.0;
+	AnsiString source = "";
+
+	TJSONValue *rateVal = obj->GetValue("fuel_rate_kg_hr");
+	TJSONValue *fuelVal = obj->GetValue("fuel_used_kg");
+	TJSONValue *co2Val = obj->GetValue("co2_kg");
+	TJSONValue *srcVal = obj->GetValue("rate_source");
+
+	try
+	{
+		if (rateVal) rate = StrToFloat((UnicodeString)rateVal->Value(), fs);
+		if (fuelVal) fuel = StrToFloat((UnicodeString)fuelVal->Value(), fs);
+		if (co2Val) co2 = StrToFloat((UnicodeString)co2Val->Value(), fs);
+		if (srcVal) source = (UnicodeString)srcVal->Value();
+	}
+	catch(...)
+	{
+		if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+		if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+		if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
+		return;
+	}
+
+	if (FuelRateLabel)
+	{
+		AnsiString srcTag = source.IsEmpty() ? "" : (" (" + source + ")");
+		FuelRateLabel->Caption = "Fuel rate: " + FloatToStrF(rate, ffFixed, 12, 1) + " kg/hr" + srcTag;
+	}
+	if (FuelUsedLabel)
+		FuelUsedLabel->Caption = "Fuel used: " + FloatToStrF(fuel, ffFixed, 12, 1) + " kg";
+	if (FuelCo2Label)
+		FuelCo2Label->Caption = "CO2 emitted: " + FloatToStrF(co2, ffFixed, 12, 1) + " kg";
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::NetHTTPClientFuelRequestError(TObject *Sender, const UnicodeString AError)
+{
+	if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
+	if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
+	if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
 }
 //---------------------------------------------------------------------------

@@ -1,4 +1,7 @@
 import os
+import re
+import json
+import time
 import joblib
 import pandas as pd
 import numpy as np
@@ -6,9 +9,10 @@ from fastapi import FastAPI, HTTPException
 from google.cloud import bigquery
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Literal
-from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from urllib import request as urllib_request
+from urllib import error as urllib_error
 import math
 
 import open_meteo_client
@@ -125,10 +129,27 @@ class CO2RecommendResponse(BaseModel):
     wind_level: str
     trajectories: Optional[List[CO2Trajectory]] = None
 
+
+class FuelSummaryResponse(BaseModel):
+    icao: str
+    flight_id: Optional[str] = None
+    phase: Optional[str] = None
+    fuel_rate_kg_hr: float
+    fuel_used_kg: float
+    co2_kg: float
+    elapsed_hr: float
+    rate_source: str
+    updated_at: datetime
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+
 # Global variables for model and scaler
 model = None
 scaler = None
 bq_client = None
+table_columns: set[str] = set()
+aircraft_db: Dict[str, Dict[str, str]] = {}
+fuel_rate_cache: Dict[str, Dict[str, Any]] = {}
 
 # Configuration
 PROJECT_ID = "iitp-class-team-5-473114"
@@ -139,6 +160,195 @@ CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "..", "BigQuery", "Yo
 
 SEQUENCE_LENGTH = 30 # Time steps required by the model
 FEATURE_COLUMNS = ['Altitude', 'GroundSpeed', 'VerticalRate', 'Track']
+
+FUEL_RATE_TTL_SEC = 6 * 3600
+DEFAULT_CO2_KG_PER_KG_FUEL = 3.16
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+AIRCRAFT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "Win64", "AircraftDB", "aircraftDatabase.csv")
+
+
+def _normalize_flight_id(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return "".join([c for c in value.upper() if c.isalnum()])
+
+
+def _load_aircraft_db_if_needed() -> None:
+    global aircraft_db
+    if aircraft_db:
+        return
+    if not os.path.exists(AIRCRAFT_DB_PATH):
+        return
+    try:
+        df = pd.read_csv(AIRCRAFT_DB_PATH)
+        if "icao24" not in df.columns:
+            return
+        needed_cols = ["icao24", "typecode", "model", "manufacturername", "icaoaircrafttype"]
+        for _, row in df.iterrows():
+            icao = str(row.get("icao24", "")).lower().strip()
+            if not icao:
+                continue
+            aircraft_db[icao] = {
+                "typecode": str(row.get("typecode", "")).strip(),
+                "model": str(row.get("model", "")).strip(),
+                "manufacturer": str(row.get("manufacturername", "")).strip(),
+                "icaoaircrafttype": str(row.get("icaoaircrafttype", "")).strip(),
+            }
+    except Exception:
+        # Non-fatal: the DB is optional for fuel estimation
+        aircraft_db = {}
+
+
+def _get_aircraft_info(icao_hex: str) -> Dict[str, str]:
+    _load_aircraft_db_if_needed()
+    return aircraft_db.get(str(icao_hex).lower().strip(), {})
+
+
+def _refresh_table_columns() -> None:
+    global table_columns
+    if not bq_client:
+        return
+    try:
+        query = f"""
+            SELECT column_name
+            FROM `{PROJECT_ID}.{DATASET_ID}.INFORMATION_SCHEMA.COLUMNS`
+            WHERE table_name = @table_name
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("table_name", "STRING", TABLE_ID)]
+        )
+        rows = bq_client.query(query, job_config=job_config).result()
+        table_columns = {str(r["column_name"]) for r in rows}
+    except Exception:
+        table_columns = set()
+
+
+def _flight_id_column() -> Optional[str]:
+    for c in ["FlightNum", "FlightID", "FlightId", "Callsign", "CallSign", "Flight"]:
+        if c in table_columns:
+            return c
+    return None
+
+
+def _call_gemini_for_fuel_rate(prompt: str) -> Optional[float]:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 120,
+            "response_mime_type": "application/json",
+        },
+    }
+    req = urllib_request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except (urllib_error.URLError, json.JSONDecodeError, TimeoutError):
+        return None
+    except Exception:
+        return None
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        rate = float(parsed.get("fuel_rate_kg_hr"))
+        return rate
+    except Exception:
+        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(text))
+        if not m:
+            return None
+        return float(m.group(1))
+
+
+def _heuristic_fuel_rate(phase: str, ground_speed_kt: Optional[float]) -> float:
+    gs = float(ground_speed_kt) if ground_speed_kt is not None else 0.0
+    if gs <= 160:
+        base = 120.0
+    elif gs <= 260:
+        base = 450.0
+    elif gs <= 400:
+        base = 1500.0
+    else:
+        base = 2500.0
+    phase_key = (phase or "").lower()
+    if "taxi" in phase_key:
+        mult = 0.4
+    elif "climb" in phase_key:
+        mult = 1.2
+    elif "descent" in phase_key:
+        mult = 0.7
+    else:
+        mult = 1.0
+    return float(max(60.0, base * mult))
+
+
+def _estimate_fuel_rate(
+    *,
+    flight_id: str,
+    phase: str,
+    icao_hex: str,
+    altitude_ft: Optional[float],
+    ground_speed_kt: Optional[float],
+) -> tuple[float, str]:
+    cache_key = flight_id or icao_hex
+    now = time.time()
+    cached = fuel_rate_cache.get(cache_key)
+    if cached and (now - cached["ts"]) <= FUEL_RATE_TTL_SEC:
+        return float(cached["rate"]), str(cached["source"])
+
+    info = _get_aircraft_info(icao_hex)
+    prompt = (
+        "You are an aviation performance assistant. Return ONLY JSON.\n"
+        "Given the flight id/callsign and current phase, estimate the typical fuel burn rate in kg/hr.\n"
+        "If unsure, use a conservative typical value for a medium narrowbody jet.\n"
+        f"Flight ID: {flight_id or 'UNKNOWN'}\n"
+        f"Phase: {phase or 'UNKNOWN'}\n"
+        f"Aircraft typecode: {info.get('typecode', '')}\n"
+        f"Aircraft model: {info.get('model', '')}\n"
+        f"Manufacturer: {info.get('manufacturer', '')}\n"
+        f"Altitude ft: {altitude_ft if altitude_ft is not None else 'UNKNOWN'}\n"
+        f"Ground speed kt: {ground_speed_kt if ground_speed_kt is not None else 'UNKNOWN'}\n"
+        "Respond with JSON: {\"fuel_rate_kg_hr\": <number>}\n"
+    )
+    rate = _call_gemini_for_fuel_rate(prompt)
+    if rate is not None:
+        rate = float(max(50.0, min(rate, 20000.0)))
+        fuel_rate_cache[cache_key] = {"rate": rate, "source": "gemini", "ts": now}
+        return rate, "gemini"
+
+    if openap is not None and info.get("typecode"):
+        try:
+            fuelflow = openap.FuelFlow(str(info.get("typecode")))
+            ff_kg_s = float(
+                fuelflow.enroute(
+                    mass=65000.0,
+                    tas=float(ground_speed_kt or 450.0),
+                    alt=float(altitude_ft or 35000.0),
+                )
+            )
+            rate = float(ff_kg_s * 3600.0)
+            fuel_rate_cache[cache_key] = {"rate": rate, "source": "openap", "ts": now}
+            return rate, "openap"
+        except Exception:
+            pass
+
+    rate = _heuristic_fuel_rate(phase, ground_speed_kt)
+    fuel_rate_cache[cache_key] = {"rate": rate, "source": "heuristic", "ts": now}
+    return rate, "heuristic"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -170,8 +380,11 @@ async def lifespan(app: FastAPI):
         
         bq_client = bigquery.Client(project=PROJECT_ID)
         print("✅ BigQuery Client initialized.")
+        _refresh_table_columns()
     except Exception as e:
         print(f"⚠️ Failed to initialize BigQuery Client: {e}")
+
+    _load_aircraft_db_if_needed()
     
     yield
     
@@ -193,13 +406,16 @@ def get_latest_flight_data_sequence(icao: str, limit: int = 100):
     query = f"""
         SELECT Altitude, GroundSpeed, VerticalRate, Track, Time_MSG_Generated
         FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
-        WHERE HexIdent = '{icao}'
+        WHERE HexIdent = @icao
         ORDER BY Time_MSG_Generated DESC
         LIMIT {limit}
     """
     
     try:
-        query_job = bq_client.query(query)
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ScalarQueryParameter("icao", "STRING", icao)]
+        )
+        query_job = bq_client.query(query, job_config=job_config)
         df = query_job.to_dataframe()
         
         if df.empty:
@@ -210,6 +426,97 @@ def get_latest_flight_data_sequence(icao: str, limit: int = 100):
         print(f"BigQuery Error: {e}")
         raise HTTPException(status_code=500, detail=f"BigQuery query failed: {str(e)}")
 
+def _prepare_sequence(icao: str) -> pd.DataFrame:
+    raw_df = get_latest_flight_data_sequence(icao, limit=100)
+    if raw_df is None or raw_df.empty:
+        raise HTTPException(status_code=404, detail=f"No data found for aircraft {icao}")
+    raw_df = raw_df.sort_values('Time_MSG_Generated', ascending=True)
+    df_features = raw_df[FEATURE_COLUMNS].copy()
+    df_features = df_features.ffill().bfill()
+    df_features = df_features.fillna(0)
+    current_len = len(df_features)
+    if current_len >= SEQUENCE_LENGTH:
+        df_final = df_features.iloc[-SEQUENCE_LENGTH:]
+    else:
+        padding_len = SEQUENCE_LENGTH - current_len
+        first_row = df_features.iloc[0:1]
+        padding = pd.concat([first_row] * padding_len, ignore_index=True)
+        df_final = pd.concat([padding, df_features], ignore_index=True)
+    return df_final
+
+
+def _predict_phase_name(df_final: pd.DataFrame) -> str:
+    if not model or not scaler:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    scaled_features = scaler.transform(df_final)
+    input_data = scaled_features.reshape(1, -1)
+    prediction = model.predict(input_data)[0]
+    phase_mapping = {0: 'Climb', 1: 'Cruise', 2: 'Descent', 3: 'Taxi'}
+    prediction_int = int(prediction)
+    return phase_mapping.get(prediction_int, f"Unknown ({prediction_int})")
+
+
+def _get_latest_snapshot(icao: str) -> Dict[str, Any]:
+    if not bq_client:
+        raise HTTPException(status_code=503, detail="BigQuery client not initialized")
+    flight_col = _flight_id_column()
+    cols = ["Altitude", "GroundSpeed", "VerticalRate", "Track", "Time_MSG_Generated"]
+    if flight_col:
+        cols.append(flight_col)
+    query = f"""
+        SELECT {", ".join(cols)}
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+        WHERE HexIdent = @icao
+        ORDER BY Time_MSG_Generated DESC
+        LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("icao", "STRING", icao)]
+    )
+    df = bq_client.query(query, job_config=job_config).to_dataframe()
+    if df.empty:
+        return {}
+    row = df.iloc[0].to_dict()
+    if flight_col and flight_col in row:
+        row["flight_id"] = row.get(flight_col)
+    return row
+
+
+def _get_flight_time_range(icao: str, flight_id: str, window_hr: int = 6) -> tuple[Optional[datetime], Optional[datetime]]:
+    if not bq_client:
+        raise HTTPException(status_code=503, detail="BigQuery client not initialized")
+    if window_hr < 1:
+        window_hr = 1
+    if window_hr > 24:
+        window_hr = 24
+    flight_col = _flight_id_column()
+    filters = ["HexIdent = @icao", f"Time_MSG_Generated >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(window_hr)} HOUR)"]
+    params = [bigquery.ScalarQueryParameter("icao", "STRING", icao)]
+    if flight_col and flight_id:
+        filters.append(f"{flight_col} = @flight_id")
+        params.append(bigquery.ScalarQueryParameter("flight_id", "STRING", flight_id))
+    query = f"""
+        SELECT MIN(Time_MSG_Generated) AS start_time, MAX(Time_MSG_Generated) AS end_time
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+        WHERE {" AND ".join(filters)}
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=params)
+    df = bq_client.query(query, job_config=job_config).to_dataframe()
+    if df.empty:
+        return None, None
+    start_time = df.iloc[0].get("start_time")
+    end_time = df.iloc[0].get("end_time")
+    if pd.isna(start_time) or pd.isna(end_time):
+        return None, None
+    start_dt = start_time.to_pydatetime() if hasattr(start_time, "to_pydatetime") else start_time
+    end_dt = end_time.to_pydatetime() if hasattr(end_time, "to_pydatetime") else end_time
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    return start_dt, end_dt
+
+
 @app.get("/predict/{icao}", response_model=PredictionResponse)
 async def predict_phase(icao: str):
     """
@@ -219,62 +526,14 @@ async def predict_phase(icao: str):
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     # 1. Get Data Sequence
-    # Fetch 100 rows to ensure we have enough valid data after merging/filling
-    raw_df = get_latest_flight_data_sequence(icao, limit=100)
-    
-    if raw_df is None or raw_df.empty:
-        raise HTTPException(status_code=404, detail=f"No data found for aircraft {icao}")
-
-    # 2. Preprocess Sequence
     try:
-        # Sort by time ascending for processing (Model expects time series sequence)
-        raw_df = raw_df.sort_values('Time_MSG_Generated', ascending=True)
-        
-        # Select only feature columns
-        df_features = raw_df[FEATURE_COLUMNS].copy()
-        
-        # Handle sparse data: 
-        # ADS-B often sends Altitude in one msg, Speed in another.
-        # Use Forward Fill (ffill) then Backward Fill (bfill) to complete rows
-        df_features = df_features.ffill().bfill()
-        
-        # If still have NaNs (e.g. all values for a column are missing), fill with 0
-        df_features = df_features.fillna(0)
-        
-        # Ensure we have exactly SEQUENCE_LENGTH rows
-        current_len = len(df_features)
-        
-        if current_len >= SEQUENCE_LENGTH:
-            # Take the most recent SEQUENCE_LENGTH rows
-            df_final = df_features.iloc[-SEQUENCE_LENGTH:]
-        else:
-            # Padding: duplicate the first row (or fill with 0) to reach SEQUENCE_LENGTH
-            # Here we prepend the first row (pad at the beginning)
-            padding_len = SEQUENCE_LENGTH - current_len
-            first_row = df_features.iloc[0:1] # Keep as DataFrame
-            padding = pd.concat([first_row] * padding_len, ignore_index=True)
-            df_final = pd.concat([padding, df_features], ignore_index=True)
-        
-        # Scale the data
-        scaled_features = scaler.transform(df_final) # Shape: (30, 4)
-        
-        # Flatten for the model: (1, 120)
-        # Reshape to (1, 30*4)
-        input_data = scaled_features.reshape(1, -1) 
-        
+        df_final = _prepare_sequence(icao)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preprocessing failed: {str(e)}")
 
     # 3. Predict
     try:
-        prediction = model.predict(input_data)[0]
-        
-        # Map integer prediction to phase name
-        phase_mapping = {0: 'Climb', 1: 'Cruise', 2: 'Descent', 3: 'Taxi'}
-        # Handle numpy int64 types safely
-        prediction_int = int(prediction)
-        prediction = phase_mapping.get(prediction_int, f"Unknown ({prediction_int})")
-        
+        prediction = _predict_phase_name(df_final)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
@@ -285,6 +544,61 @@ async def predict_phase(icao: str):
         icao=icao,
         phase=prediction,
         features=features_response
+    )
+
+
+@app.get("/fuel/summary", response_model=FuelSummaryResponse)
+async def fuel_summary(icao: str, flight_id: Optional[str] = None, phase: Optional[str] = None, time_window_hr: int = 6):
+    if not bq_client:
+        raise HTTPException(status_code=503, detail="BigQuery client not initialized")
+    icao = str(icao).strip()
+    if not icao:
+        raise HTTPException(status_code=400, detail="icao is required")
+    flight_id_norm = _normalize_flight_id(flight_id)
+
+    snapshot = _get_latest_snapshot(icao)
+    alt = snapshot.get("Altitude")
+    gs = snapshot.get("GroundSpeed")
+    if not flight_id_norm and snapshot.get("flight_id"):
+        flight_id_norm = _normalize_flight_id(str(snapshot.get("flight_id")))
+
+    if not phase:
+        try:
+            df_final = _prepare_sequence(icao)
+            phase = _predict_phase_name(df_final)
+        except Exception:
+            phase = "Unknown"
+
+    rate, source = _estimate_fuel_rate(
+        flight_id=flight_id_norm,
+        phase=phase or "",
+        icao_hex=icao,
+        altitude_ft=float(alt) if alt is not None else None,
+        ground_speed_kt=float(gs) if gs is not None else None,
+    )
+
+    start_time, end_time = _get_flight_time_range(icao, flight_id_norm, window_hr=time_window_hr)
+    if not end_time:
+        end_time = datetime.now(timezone.utc)
+    if not start_time:
+        start_time = end_time
+
+    elapsed_hr = max(0.0, (end_time - start_time).total_seconds() / 3600.0)
+    fuel_used = float(rate * elapsed_hr)
+    co2_kg = float(fuel_used * DEFAULT_CO2_KG_PER_KG_FUEL)
+
+    return FuelSummaryResponse(
+        icao=icao,
+        flight_id=flight_id_norm or None,
+        phase=phase,
+        fuel_rate_kg_hr=float(rate),
+        fuel_used_kg=fuel_used,
+        co2_kg=co2_kg,
+        elapsed_hr=float(elapsed_hr),
+        rate_source=source,
+        updated_at=datetime.now(timezone.utc),
+        start_time=start_time,
+        end_time=end_time,
     )
 
 @app.get("/health")
