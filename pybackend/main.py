@@ -146,6 +146,43 @@ class FuelSummaryResponse(BaseModel):
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
 
+
+class SpeechQaSnapshot(BaseModel):
+    icao: Optional[str] = None
+    flight_id: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    altitude_ft: Optional[float] = None
+    speed_kt: Optional[float] = None
+    heading_deg: Optional[float] = None
+    route: Optional[str] = None
+
+
+class SpeechQaRequest(BaseModel):
+    transcript: str
+    snapshot: Optional[SpeechQaSnapshot] = None
+
+
+class SpeechQaResponse(BaseModel):
+    transcript: str
+    is_question: bool
+    intent: Literal[
+        "location",
+        "altitude",
+        "destination",
+        "speed",
+        "heading",
+        "unsupported",
+        "not_question",
+        "missing_icao",
+        "not_found",
+        "error",
+    ]
+    icao: Optional[str] = None
+    answer: str
+    data_source: Literal["snapshot", "bigquery", "hybrid", "none"] = "none"
+    confidence: Optional[float] = None
+
 # Global variables for model and scaler
 model = None
 scaler = None
@@ -167,6 +204,8 @@ FEATURE_COLUMNS = ['Altitude', 'GroundSpeed', 'VerticalRate', 'Track']
 FUEL_RATE_TTL_SEC = 6 * 3600
 DEFAULT_CO2_KG_PER_KG_FUEL = 3.16
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+SPEECH_QA_CORE_INTENTS = {"location", "altitude", "destination", "speed", "heading"}
+SPEECH_QA_SUPPORTED_INTENTS = SPEECH_QA_CORE_INTENTS | {"unsupported"}
 
 AIRCRAFT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "Win64", "AircraftDB", "aircraftDatabase.csv")
 
@@ -323,6 +362,294 @@ def _estimate_elapsed_from_route(route_text: Optional[str], cur_lat: Any, cur_lo
         return None
     est_hr = dist_nm / speed_for_elapsed
     return max(0.0, est_hr)
+
+
+def _is_valid_icao_hex(value: Optional[str]) -> bool:
+    key = _normalize_icao(value)
+    return bool(re.fullmatch(r"[0-9A-F]{6}", key))
+
+
+def _extract_icao_hex(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    raw = str(text).upper()
+    m = re.search(r"\b([0-9A-F]{6})\b", raw)
+    if m:
+        return m.group(1)
+    compact = re.sub(r"[^0-9A-Z]", "", raw)
+    m2 = re.search(r"([0-9A-F]{6})", compact)
+    return m2.group(1) if m2 else ""
+
+
+def _normalize_route_text(value: Optional[str]) -> str:
+    route = str(value or "").strip().upper()
+    if route in {"", "N/A", "UNKNOWN", "LOADING", "NONE"}:
+        return ""
+    return route
+
+
+def _parse_json_object_from_text(raw_text: str) -> Optional[Dict[str, Any]]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None
+
+    candidates: List[str] = [text]
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        candidates.append(fenced.group(1).strip())
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(text[start : end + 1].strip())
+
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            parsed = json.loads(c)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"true", "1", "yes", "y"}:
+        return True
+    if text in {"false", "0", "no", "n"}:
+        return False
+    return default
+
+
+def _call_gemini_for_speech_parse(transcript: str) -> Optional[Dict[str, Any]]:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        print("[speech-qa] GEMINI_API_KEY not set; skipping Gemini parse.")
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    prompt = (
+        "Classify this ASR transcript for aircraft QA.\n"
+        "Return exactly one compact JSON object with keys:\n"
+        "is_question (boolean), intent (location|altitude|destination|speed|heading|unsupported), "
+        "icao (6-char uppercase hex string or empty), confidence (0..1).\n"
+        "No markdown. No extra keys. No explanation.\n"
+        f"transcript: {transcript}\n"
+    )
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 128,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+
+    req = urllib_request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[speech-qa] Gemini request failed: {e}")
+        return None
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+        text_chunks = [str(p.get("text") or "").strip() for p in parts]
+        raw_text = "\n".join([x for x in text_chunks if x]).strip()
+    except Exception:
+        print(f"[speech-qa] Unexpected Gemini parse response shape: {str(data)[:300]}")
+        return None
+
+    if not raw_text:
+        return None
+    parsed = _parse_json_object_from_text(raw_text)
+    if not parsed:
+        print(f"[speech-qa] Could not parse Gemini speech JSON: {raw_text[:240]}")
+        return None
+
+    intent = str(parsed.get("intent") or "").strip().lower()
+    intent_alias: Dict[str, str] = {
+        "position": "location",
+        "latlon": "location",
+        "latitude": "location",
+        "longitude": "location",
+        "route": "destination",
+        "dest": "destination",
+        "groundspeed": "speed",
+        "track": "heading",
+    }
+    intent = intent_alias.get(intent, intent)
+    if intent not in SPEECH_QA_SUPPORTED_INTENTS:
+        intent = "unsupported"
+
+    icao = _normalize_icao(str(parsed.get("icao") or ""))
+    if not _is_valid_icao_hex(icao):
+        icao = ""
+
+    conf = parsed.get("confidence")
+    confidence: Optional[float] = None
+    if conf is not None:
+        cval = _safe_float(conf, default=-1.0)
+        if cval >= 0.0:
+            confidence = float(min(max(cval, 0.0), 1.0))
+
+    return {
+        "is_question": _coerce_bool(parsed.get("is_question"), default=False),
+        "intent": intent,
+        "icao": icao,
+        "confidence": confidence,
+    }
+
+
+def _fallback_speech_parse(transcript: str) -> Dict[str, Any]:
+    text = str(transcript or "").strip()
+    low = text.lower()
+
+    is_question = ("?" in text) or any(
+        token in low
+        for token in ["where", "what", "which", "how", "altitude", "speed", "heading", "destination", "route"]
+    )
+    intent = "unsupported"
+    if ("destination" in low) or ("route" in low):
+        intent = "destination"
+    elif ("altitude" in low) or ("altitidude" in low):
+        intent = "altitude"
+    elif ("speed" in low) or ("ground speed" in low):
+        intent = "speed"
+    elif ("heading" in low) or ("track" in low):
+        intent = "heading"
+    elif ("where" in low) or ("location" in low) or ("latitude" in low) or ("longitude" in low):
+        intent = "location"
+
+    if intent in SPEECH_QA_CORE_INTENTS:
+        is_question = True
+
+    icao = _extract_icao_hex(text)
+    return {
+        "is_question": bool(is_question),
+        "intent": intent,
+        "icao": icao if _is_valid_icao_hex(icao) else "",
+        "confidence": None,
+    }
+
+
+def _clean_snapshot_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    val = _safe_float(value, default=float("nan"))
+    return float(val) if math.isfinite(val) else None
+
+
+def _merge_snapshot_with_bq(icao: str, req_snapshot: Optional[SpeechQaSnapshot]) -> tuple[Dict[str, Any], str]:
+    merged: Dict[str, Any] = {
+        "flight_id": "",
+        "lat": None,
+        "lon": None,
+        "altitude_ft": None,
+        "speed_kt": None,
+        "heading_deg": None,
+        "route": "",
+    }
+    used_snapshot = False
+    used_bigquery = False
+    target_icao = _normalize_icao(icao)
+
+    if req_snapshot and _normalize_icao(req_snapshot.icao) == target_icao:
+        if req_snapshot.flight_id:
+            merged["flight_id"] = _normalize_flight_id(req_snapshot.flight_id)
+            if merged["flight_id"]:
+                used_snapshot = True
+        route_text = _normalize_route_text(req_snapshot.route)
+        if route_text:
+            merged["route"] = route_text
+            used_snapshot = True
+        for key in ("lat", "lon", "altitude_ft", "speed_kt", "heading_deg"):
+            val = _clean_snapshot_float(getattr(req_snapshot, key))
+            if val is not None:
+                merged[key] = val
+                used_snapshot = True
+
+    bq_row: Dict[str, Any] = {}
+    try:
+        bq_row = _get_latest_snapshot(target_icao)
+    except Exception:
+        bq_row = {}
+
+    if bq_row:
+        if not merged.get("flight_id"):
+            flight_id = _normalize_flight_id(str(bq_row.get("flight_id") or ""))
+            if flight_id:
+                merged["flight_id"] = flight_id
+                used_bigquery = True
+        if not merged.get("route"):
+            route = _normalize_route_text(bq_row.get("route"))
+            if route:
+                merged["route"] = route
+                used_bigquery = True
+
+        bq_map = {
+            "lat": bq_row.get("lat"),
+            "lon": bq_row.get("lon"),
+            "altitude_ft": bq_row.get("Altitude"),
+            "speed_kt": bq_row.get("GroundSpeed"),
+            "heading_deg": bq_row.get("Track"),
+        }
+        for key, value in bq_map.items():
+            if merged.get(key) is None:
+                val = _clean_snapshot_float(value)
+                if val is not None:
+                    merged[key] = val
+                    used_bigquery = True
+
+    if used_snapshot and used_bigquery:
+        source = "hybrid"
+    elif used_snapshot:
+        source = "snapshot"
+    elif used_bigquery:
+        source = "bigquery"
+    else:
+        source = "none"
+    return merged, source
+
+
+def _format_speech_answer(intent: str, icao: str, data: Dict[str, Any]) -> tuple[str, str]:
+    if intent == "location":
+        lat = data.get("lat")
+        lon = data.get("lon")
+        if lat is None or lon is None:
+            return "not_found", f"I found ICAO {icao}, but latitude/longitude is not available right now."
+        return "location", f"Aircraft {icao} is at latitude {float(lat):.5f}, longitude {float(lon):.5f}."
+    if intent == "altitude":
+        alt = data.get("altitude_ft")
+        if alt is None:
+            return "not_found", f"I found ICAO {icao}, but altitude is not available right now."
+        return "altitude", f"Aircraft {icao} altitude is {float(alt):.0f} ft."
+    if intent == "destination":
+        route = _normalize_route_text(data.get("route"))
+        if not route:
+            return "not_found", f"I found ICAO {icao}, but route/destination is not available right now."
+        return "destination", f"Aircraft {icao} route is {route}."
+    if intent == "speed":
+        speed = data.get("speed_kt")
+        if speed is None:
+            return "not_found", f"I found ICAO {icao}, but speed is not available right now."
+        return "speed", f"Aircraft {icao} speed is {float(speed):.0f} kt."
+    if intent == "heading":
+        heading = data.get("heading_deg")
+        if heading is None:
+            return "not_found", f"I found ICAO {icao}, but heading is not available right now."
+        return "heading", f"Aircraft {icao} heading is {float(heading):.0f} degrees."
+    return "unsupported", "I can answer location, altitude, destination, speed, and heading by ICAO."
 
 
 def _call_gemini_for_fuel_rate(prompt: str) -> Optional[float]:
@@ -1046,6 +1373,81 @@ async def fuel_summary(
         start_time=start_time,
         end_time=end_time,
     )
+
+
+@app.post("/speech/qa", response_model=SpeechQaResponse)
+async def speech_qa(req: SpeechQaRequest):
+    transcript = str(req.transcript or "").strip()
+    if not transcript:
+        raise HTTPException(status_code=400, detail="transcript is required")
+
+    parsed = _call_gemini_for_speech_parse(transcript) or _fallback_speech_parse(transcript)
+    is_question = bool(parsed.get("is_question"))
+    confidence = parsed.get("confidence")
+
+    if not is_question:
+        return SpeechQaResponse(
+            transcript=transcript,
+            is_question=False,
+            intent="not_question",
+            icao=None,
+            answer="No question detected.",
+            data_source="none",
+            confidence=confidence,
+        )
+
+    intent = str(parsed.get("intent") or "unsupported").strip().lower()
+    if intent not in SPEECH_QA_SUPPORTED_INTENTS:
+        intent = "unsupported"
+    if intent == "unsupported":
+        return SpeechQaResponse(
+            transcript=transcript,
+            is_question=True,
+            intent="unsupported",
+            icao=None,
+            answer="I can answer location, altitude, destination, speed, and heading by ICAO.",
+            data_source="none",
+            confidence=confidence,
+        )
+
+    icao = _normalize_icao(parsed.get("icao"))
+    if not _is_valid_icao_hex(icao):
+        icao = _extract_icao_hex(transcript)
+    if not _is_valid_icao_hex(icao):
+        return SpeechQaResponse(
+            transcript=transcript,
+            is_question=True,
+            intent="missing_icao",
+            icao=None,
+            answer="Please include a 6-character ICAO hex code (e.g., A01BBC).",
+            data_source="none",
+            confidence=confidence,
+        )
+
+    try:
+        merged_data, source = _merge_snapshot_with_bq(icao, req.snapshot)
+        out_intent, answer = _format_speech_answer(intent, icao, merged_data)
+        return SpeechQaResponse(
+            transcript=transcript,
+            is_question=True,
+            intent=out_intent,
+            icao=icao,
+            answer=answer,
+            data_source=source,
+            confidence=confidence,
+        )
+    except Exception as e:
+        print(f"[speech-qa] Unexpected error: {e}")
+        return SpeechQaResponse(
+            transcript=transcript,
+            is_question=True,
+            intent="error",
+            icao=icao,
+            answer="Question answering is temporarily unavailable.",
+            data_source="none",
+            confidence=confidence,
+        )
+
 
 @app.get("/health")
 async def health_check():

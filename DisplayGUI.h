@@ -332,10 +332,12 @@ __published:	// IDE-managed Components
 	void __fastcall SpeechPopupClose(TObject *Sender, TCloseAction &Action);
     void __fastcall NetHTTPClientPredictionRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
 	void __fastcall NetHTTPClientPredictionRequestError(TObject *Sender, const UnicodeString AError);
-    void __fastcall NetHTTPClientWeatherRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
+	void __fastcall NetHTTPClientWeatherRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
     void __fastcall NetHTTPClientWeatherRequestError(TObject *Sender, const UnicodeString AError);
     void __fastcall NetHTTPClientFuelRequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
 	void __fastcall NetHTTPClientFuelRequestError(TObject *Sender, const UnicodeString AError);
+	void __fastcall NetHTTPClientSpeechQARequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse);
+	void __fastcall NetHTTPClientSpeechQARequestError(TObject *Sender, const UnicodeString AError);
 
 	private:	// User declarations
 	friend class TRouteFetchThread;
@@ -378,6 +380,7 @@ __published:	// IDE-managed Components
 									  double currentLon = 0.0,
 									  double currentGsKt = 0.0,
 									  const AnsiString &routeText = "");
+	void __fastcall RequestSpeechQa(const AnsiString &transcript);
 
 	public:		// User declarations
 	__fastcall TForm1(TComponent* Owner);
@@ -417,6 +420,7 @@ __published:	// IDE-managed Components
     TNetHTTPClient             *NetHTTPClientPrediction;
     TNetHTTPClient             *NetHTTPClientWeather;
 	TNetHTTPClient             *NetHTTPClientFuel;
+	TNetHTTPClient             *NetHTTPClientSpeechQA;
     ISpeechRecoGrammar         *SRGrammar;
 	int                        MouseDownX,MouseDownY;
 	bool                       MouseDown;

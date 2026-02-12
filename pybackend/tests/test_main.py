@@ -102,8 +102,145 @@ def test_predict_no_data(mock_bigquery):
         
         with patch("main.model", MagicMock()), patch("main.scaler", MagicMock()):
             response = client.get("/predict/UNKNOWN")
-            assert response.status_code == 404
-            assert "No data found" in response.json()["detail"]
+            assert response.status_code == 200
+            assert response.json()["phase"] == "Unknown"
+
+
+def test_speech_qa_not_question_returns_early():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        return_value={"is_question": False, "intent": "unsupported", "icao": "", "confidence": 0.91},
+    ), patch("main._get_latest_snapshot") as mock_snapshot:
+        response = client.post("/speech/qa", json={"transcript": "hello team"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["is_question"] is False
+        assert data["intent"] == "not_question"
+        assert data["data_source"] == "none"
+        mock_snapshot.assert_not_called()
+
+
+def test_speech_qa_location_from_snapshot():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        return_value={"is_question": True, "intent": "location", "icao": "A01BBC", "confidence": 0.8},
+    ), patch("main._get_latest_snapshot", return_value={}):
+        response = client.post(
+            "/speech/qa",
+            json={
+                "transcript": "where is a01bbc",
+                "snapshot": {"icao": "A01BBC", "lat": 40.12345, "lon": -79.54321},
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["intent"] == "location"
+        assert data["data_source"] == "snapshot"
+        assert "latitude 40.12345" in data["answer"]
+        assert "longitude -79.54321" in data["answer"]
+
+
+def test_speech_qa_altitude_falls_back_to_bigquery():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        return_value={"is_question": True, "intent": "altitude", "icao": "A01BBC", "confidence": 0.7},
+    ), patch("main._get_latest_snapshot", return_value={"Altitude": 12000}):
+        response = client.post(
+            "/speech/qa",
+            json={
+                "transcript": "what is altitude of a01bbc",
+                "snapshot": {"icao": "A01BBC", "lat": 40.0},
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["intent"] == "altitude"
+        assert data["data_source"] == "hybrid"
+        assert "12000 ft" in data["answer"]
+
+
+def test_speech_qa_destination_route():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        return_value={"is_question": True, "intent": "destination", "icao": "A01BBC", "confidence": 0.7},
+    ), patch("main._get_latest_snapshot", return_value={"route": "LGD-PIT"}):
+        response = client.post("/speech/qa", json={"transcript": "where is destination of a01bbc"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["intent"] == "destination"
+        assert "LGD-PIT" in data["answer"]
+
+
+def test_speech_qa_speed_and_heading():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        side_effect=[
+            {"is_question": True, "intent": "speed", "icao": "A01BBC", "confidence": 0.8},
+            {"is_question": True, "intent": "heading", "icao": "A01BBC", "confidence": 0.8},
+        ],
+    ), patch("main._get_latest_snapshot", return_value={}):
+        speed_response = client.post(
+            "/speech/qa",
+            json={"transcript": "speed of a01bbc", "snapshot": {"icao": "A01BBC", "speed_kt": 455.0}},
+        )
+        heading_response = client.post(
+            "/speech/qa",
+            json={"transcript": "heading of a01bbc", "snapshot": {"icao": "A01BBC", "heading_deg": 271.0}},
+        )
+        assert speed_response.status_code == 200
+        assert heading_response.status_code == 200
+        assert speed_response.json()["intent"] == "speed"
+        assert "455 kt" in speed_response.json()["answer"]
+        assert heading_response.json()["intent"] == "heading"
+        assert "271 degrees" in heading_response.json()["answer"]
+
+
+def test_speech_qa_missing_icao_prompt():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        return_value={"is_question": True, "intent": "location", "icao": "", "confidence": 0.3},
+    ):
+        response = client.post("/speech/qa", json={"transcript": "where is it"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["intent"] == "missing_icao"
+        assert "6-character ICAO" in data["answer"]
+
+
+def test_speech_qa_unsupported_intent():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        return_value={"is_question": True, "intent": "unsupported", "icao": "", "confidence": 0.2},
+    ):
+        response = client.post("/speech/qa", json={"transcript": "who is the pilot of a01bbc"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["intent"] == "unsupported"
+        assert "I can answer location" in data["answer"]
+
+
+def test_speech_qa_not_found_field():
+    with patch(
+        "main._call_gemini_for_speech_parse",
+        return_value={"is_question": True, "intent": "speed", "icao": "A01BBC", "confidence": 0.6},
+    ), patch("main._get_latest_snapshot", return_value={}):
+        response = client.post("/speech/qa", json={"transcript": "what speed is a01bbc"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["intent"] == "not_found"
+        assert "speed is not available" in data["answer"]
+
+
+def test_speech_qa_gemini_parse_failure_uses_regex_fallback():
+    with patch("main._call_gemini_for_speech_parse", return_value=None), patch(
+        "main._get_latest_snapshot", return_value={"Altitude": 12000}
+    ):
+        response = client.post("/speech/qa", json={"transcript": "what is the altitude of A01BBC"})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["intent"] == "altitude"
+        assert data["icao"] == "A01BBC"
+        assert "12000 ft" in data["answer"]
 
 # --- Integration Test (Optional - requires real credentials) ---
 @pytest.mark.skipif(not os.path.exists(os.path.join(os.path.dirname(__file__), "..", "..", "BigQuery", "YourJsonFile.json")), reason="No credentials file")

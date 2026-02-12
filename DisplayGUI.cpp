@@ -43,6 +43,7 @@
 #define WEATHER_OVERLAY_URL "http://localhost:8001/weather/overlay"
 #define CO2_RECOMMEND_URL "http://localhost:8001/co2/recommend"
 #define FUEL_SUMMARY_URL "http://localhost:8001/fuel/summary"
+#define SPEECH_QA_URL "http://localhost:8001/speech/qa"
 #define MAP_CENTER_LAT  40.73612;
 #define MAP_CENTER_LON -80.33158;
 
@@ -1162,6 +1163,11 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  NetHTTPClientFuel->OnRequestError = NetHTTPClientFuelRequestError;
  NetHTTPClientFuel->ConnectionTimeout = 3000;
  NetHTTPClientFuel->ResponseTimeout = 10000;
+ NetHTTPClientSpeechQA = new TNetHTTPClient(this);
+ NetHTTPClientSpeechQA->OnRequestCompleted = NetHTTPClientSpeechQARequestCompleted;
+ NetHTTPClientSpeechQA->OnRequestError = NetHTTPClientSpeechQARequestError;
+ NetHTTPClientSpeechQA->ConnectionTimeout = 3000;
+ NetHTTPClientSpeechQA->ResponseTimeout = 10000;
 
  PhaseLabel= new TLabel(Panel4);
  PhaseLabel->Parent=Panel4;
@@ -2182,6 +2188,94 @@ void __fastcall TForm1::RequestFuelSummary(const AnsiString &icaoHex,
    if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
    if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
  }
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::RequestSpeechQa(const AnsiString &transcript)
+{
+ if (!NetHTTPClientSpeechQA) return;
+
+ AnsiString text = transcript.Trim();
+ if (text.IsEmpty()) return;
+ if (!BackendRequestsAllowed()) return;
+
+ std::unique_ptr<TJSONObject> root(new TJSONObject());
+ root->AddPair("transcript", (UnicodeString)text);
+
+ std::unique_ptr<TJSONObject> snapshot(new TJSONObject());
+ bool hasSnapshotField = false;
+
+ AnsiString icao = NormalizeCodeToken(ICAOLabel ? ICAOLabel->Caption : "");
+ if ((icao.IsEmpty() || icao == "NA") && TrackHook.Valid_CC)
+ {
+   char hexBuf[16];
+   snprintf(hexBuf, sizeof(hexBuf), "%06X", (unsigned int)TrackHook.ICAO_CC);
+   icao = (AnsiString)hexBuf;
+ }
+ if (!icao.IsEmpty() && icao != "NA")
+ {
+   snapshot->AddPair("icao", (UnicodeString)icao);
+   hasSnapshotField = true;
+ }
+
+ AnsiString flight = NormalizeFlightNum(FlightNumLabel ? FlightNumLabel->Caption : "");
+ if (!flight.IsEmpty() && flight != "NA")
+ {
+   snapshot->AddPair("flight_id", (UnicodeString)flight);
+   hasSnapshotField = true;
+ }
+
+ AnsiString route = RouteLabel ? RouteLabel->Caption.Trim().UpperCase() : "";
+ if (!route.IsEmpty() && route != "N/A" && route != "UNKNOWN" && route != "LOADING")
+ {
+   snapshot->AddPair("route", (UnicodeString)route);
+   hasSnapshotField = true;
+ }
+
+ if (TrackHook.Valid_CC)
+ {
+   TADS_B_Aircraft *hookedData = (TADS_B_Aircraft *)ght_get(HashTable, sizeof(TrackHook.ICAO_CC), (void *)&TrackHook.ICAO_CC);
+   if (hookedData)
+   {
+	 if (hookedData->HaveLatLon)
+	 {
+	   snapshot->AddPair("lat", new TJSONNumber(hookedData->Latitude));
+	   snapshot->AddPair("lon", new TJSONNumber(hookedData->Longitude));
+	   hasSnapshotField = true;
+	 }
+	 if (hookedData->HaveAltitude)
+	 {
+	   snapshot->AddPair("altitude_ft", new TJSONNumber(hookedData->Altitude));
+	   hasSnapshotField = true;
+	 }
+	 if (hookedData->HaveSpeedAndHeading)
+	 {
+	   snapshot->AddPair("speed_kt", new TJSONNumber(hookedData->Speed));
+	   snapshot->AddPair("heading_deg", new TJSONNumber(hookedData->Heading));
+	   hasSnapshotField = true;
+	 }
+   }
+ }
+
+ if (hasSnapshotField)
+   root->AddPair("snapshot", snapshot.release());
+
+ UnicodeString payload = root->ToJSON();
+ TStringStream *body = NULL;
+ try
+ {
+   body = new TStringStream(payload, TEncoding::UTF8, false);
+   System::Net::Urlclient::TNetHeaders headers;
+   headers.Length = 1;
+   headers[0] = System::Net::Urlclient::TNameValuePair("Content-Type", "application/json");
+   NetHTTPClientSpeechQA->Post(AnsiString(SPEECH_QA_URL), body, NULL, headers);
+   BackendRegisterSuccess();
+ }
+ catch (const Exception &)
+ {
+   BackendRegisterFailure();
+   AppendPopupMemoLine("Answer: Backend unavailable for question answering.");
+ }
+ if (body) delete body;
 }
 //---------------------------------------------------------------------------
  void __fastcall TForm1::HookTrack(int X, int Y,bool CPA_Hook)
@@ -3913,6 +4007,8 @@ void __fastcall TForm1::FinalizeWhisperRun(DWORD exitCode, bool forcedStop)
     else
     {
       SpeechPopupMemo->Lines->AddStrings(text);
+      AppendPopupMemoLine("Analyzing question...");
+      RequestSpeechQa(text->Text);
     }
     delete text;
   }
@@ -4256,5 +4352,41 @@ void __fastcall TForm1::NetHTTPClientFuelRequestError(TObject *Sender, const Uni
 	if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
 	if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
 	if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::NetHTTPClientSpeechQARequestCompleted(TObject *Sender, _di_IHTTPResponse AResponse)
+{
+	if (!AResponse || (AResponse->StatusCode < 200 || AResponse->StatusCode >= 300))
+	{
+		BackendRegisterFailure();
+		AppendPopupMemoLine("Answer: Unable to process this question right now.");
+		return;
+	}
+
+	UnicodeString content = AResponse->ContentAsString(TEncoding::UTF8);
+	std::unique_ptr<TJSONValue> root(TJSONObject::ParseJSONValue(content));
+	TJSONObject *obj = dynamic_cast<TJSONObject *>(root.get());
+	if (!obj)
+	{
+		BackendRegisterFailure();
+		AppendPopupMemoLine("Answer: Unable to process this question right now.");
+		return;
+	}
+
+	TJSONValue *answerVal = obj->GetValue("answer");
+	AnsiString answer = "";
+	if (answerVal)
+		answer = ((UnicodeString)answerVal->Value()).Trim();
+	if (answer.IsEmpty())
+		answer = "Unable to process this question right now.";
+
+	BackendRegisterSuccess();
+	AppendPopupMemoLine("Answer: " + answer);
+}
+//---------------------------------------------------------------------------
+void __fastcall TForm1::NetHTTPClientSpeechQARequestError(TObject *Sender, const UnicodeString AError)
+{
+	BackendRegisterFailure();
+	AppendPopupMemoLine("Answer: Backend unavailable for question answering.");
 }
 //---------------------------------------------------------------------------
