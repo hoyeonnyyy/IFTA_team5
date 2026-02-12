@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import asyncio
 import joblib
 import pandas as pd
 import numpy as np
@@ -10,7 +11,7 @@ from google.cloud import bigquery
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time, timedelta
 from urllib import request as urllib_request
 from urllib import error as urllib_error
 import math
@@ -139,6 +140,8 @@ class FuelSummaryResponse(BaseModel):
     co2_kg: float
     elapsed_hr: float
     rate_source: str
+    elapsed_source: str = "observed"
+    estimated: bool = False
     updated_at: datetime
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
@@ -172,6 +175,27 @@ def _normalize_flight_id(value: Optional[str]) -> str:
     if not value:
         return ""
     return "".join([c for c in value.upper() if c.isalnum()])
+
+
+def _normalize_icao(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return "".join([c for c in str(value).upper() if c.isalnum()])
+
+
+def _is_placeholder_icao(value: Optional[str]) -> bool:
+    key = _normalize_icao(value)
+    return key in {"", "NA", "NOHOOK", "NODATA", "UNKNOWN"}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        f = float(value)
+    except Exception:
+        return float(default)
+    if not math.isfinite(f):
+        return float(default)
+    return float(f)
 
 
 def _load_aircraft_db_if_needed() -> None:
@@ -231,17 +255,89 @@ def _flight_id_column() -> Optional[str]:
     return None
 
 
+def _first_existing_column(candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in table_columns:
+            return c
+    return None
+
+
+def _route_column() -> Optional[str]:
+    return _first_existing_column(["Route", "ROUTE", "route"])
+
+
+def _lat_column() -> Optional[str]:
+    return _first_existing_column(["Latitude", "LAT", "Lat", "lat", "latitude"])
+
+
+def _lon_column() -> Optional[str]:
+    return _first_existing_column(["Longitude", "LON", "Lon", "lon", "longitude"])
+
+
+# Minimal airport coordinates for demo routes (IATA -> lat/lon)
+AIRPORT_COORDS_IATA: Dict[str, tuple[float, float]] = {
+    "ONT": (34.055999, -117.601997),
+    "PHL": (39.871899, -75.241096),
+    "CLT": (35.214001, -80.943100),
+    "CAK": (40.916100, -81.442200),
+    "PIT": (40.491500, -80.232903),
+    "BWI": (39.175400, -76.668297),
+    "DCA": (38.851200, -77.040199),
+    "DTW": (42.212399, -83.353401),
+}
+
+
+def _haversine_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r_km = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2.0) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    km = r_km * c
+    return km / 1.852
+
+
+def _estimate_elapsed_from_route(route_text: Optional[str], cur_lat: Any, cur_lon: Any, gs_kt: Any) -> Optional[float]:
+    route = str(route_text or "").strip().upper()
+    # Use only simple two-airport pattern for demo reliability: AAA-BBB
+    m = re.fullmatch(r"([A-Z]{3})-([A-Z]{3})", route)
+    if not m:
+        return None
+    dep = m.group(1)
+    if dep not in AIRPORT_COORDS_IATA:
+        return None
+
+    lat = _safe_float(cur_lat, default=float("nan"))
+    lon = _safe_float(cur_lon, default=float("nan"))
+    gs = _safe_float(gs_kt, default=0.0)
+    if not math.isfinite(lat) or not math.isfinite(lon):
+        return None
+
+    dep_lat, dep_lon = AIRPORT_COORDS_IATA[dep]
+    dist_nm = _haversine_nm(dep_lat, dep_lon, lat, lon)
+    # Guardrails so descent/taxi speeds do not explode elapsed estimate.
+    speed_for_elapsed = min(max(gs, 150.0), 520.0)
+    if speed_for_elapsed <= 0.0:
+        return None
+    est_hr = dist_nm / speed_for_elapsed
+    return max(0.0, est_hr)
+
+
 def _call_gemini_for_fuel_rate(prompt: str) -> Optional[float]:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
+        print("[gemini] GEMINI_API_KEY not set; skipping Gemini fuel-rate estimation.")
         return None
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 120,
-            "response_mime_type": "application/json",
+            "temperature": 0.0,
+            "maxOutputTokens": 64,
+            "stopSequences": ["\n"],
+            "thinkingConfig": {"thinkingBudget": 0},
         },
     }
     req = urllib_request.Request(
@@ -251,27 +347,231 @@ def _call_gemini_for_fuel_rate(prompt: str) -> Optional[float]:
         method="POST",
     )
     try:
-        with urllib_request.urlopen(req, timeout=6) as resp:
+        with urllib_request.urlopen(req, timeout=4) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except (urllib_error.URLError, json.JSONDecodeError, TimeoutError):
+    except urllib_error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        print(f"[gemini] HTTPError status={e.code}, reason={e.reason}, body={body[:300]}")
+        return None
+    except urllib_error.URLError as e:
+        print(f"[gemini] URLError: {e}")
+        return None
+    except TimeoutError:
+        print("[gemini] TimeoutError while calling Gemini.")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[gemini] JSON decode error from Gemini response: {e}")
         return None
     except Exception:
+        print("[gemini] Unexpected exception while calling Gemini.")
         return None
     try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
+        candidate0 = data["candidates"][0]
+        finish_reason = str(candidate0.get("finishReason", ""))
+        if finish_reason:
+            print(f"[gemini] finishReason={finish_reason}")
+        parts = candidate0["content"]["parts"]
+        text_chunks: List[str] = []
+        for p in parts:
+            t = str(p.get("text") or "").strip()
+            if t:
+                text_chunks.append(t)
+        text = "\n".join(text_chunks).strip()
+        if len(text_chunks) > 1:
+            print(f"[gemini] Response split across {len(text_chunks)} text parts.")
     except Exception:
+        print(f"[gemini] Unexpected response shape: {str(data)[:300]}")
         return None
     if not text:
+        print("[gemini] Empty text response from Gemini.")
         return None
+    raw_text = str(text).strip()
+    print(f"[gemini] Raw response text: {raw_text[:240]}")
+    # Preferred parse path: natural-language key/value line
+    # e.g. "fuel_rate_kg_hr: 2450"
+    for key in ("fuel_rate_kg_hr", "fuel rate", "fuel_rate", "rate"):
+        m_key = re.search(
+            rf"{re.escape(key)}\s*[:=]\s*([-+]?[0-9]+(?:\.[0-9]+)?)",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if m_key:
+            value = float(m_key.group(1))
+            print(f"[gemini] Parsed key regex {key}={value}")
+            return value
+
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", raw_text, flags=re.IGNORECASE | re.DOTALL)
+    candidate = fenced.group(1).strip() if fenced else raw_text
     try:
-        parsed = json.loads(text)
-        rate = float(parsed.get("fuel_rate_kg_hr"))
-        return rate
+        parsed = json.loads(candidate)
+        for key in ("fuel_rate_kg_hr", "fuel_rate", "rate"):
+            if key in parsed:
+                try:
+                    value = float(parsed.get(key))
+                    print(f"[gemini] Parsed {key}={value}")
+                    return value
+                except Exception:
+                    m = re.search(r"([-+]?[0-9]+(?:\.[0-9]+)?)", str(parsed.get(key)))
+                    if m:
+                        value = float(m.group(1))
+                        print(f"[gemini] Parsed numeric token from {key}: {value}")
+                        return value
+        print(f"[gemini] JSON parsed but expected key missing: {str(parsed)[:200]}")
     except Exception:
-        m = re.search(r"([0-9]+(?:\.[0-9]+)?)", str(text))
+        # Try extracting a JSON object when extra prose wraps it.
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            obj_text = candidate[start : end + 1]
+            try:
+                parsed_obj = json.loads(obj_text)
+                for key in ("fuel_rate_kg_hr", "fuel_rate", "rate"):
+                    if key in parsed_obj:
+                        try:
+                            value = float(parsed_obj.get(key))
+                            print(f"[gemini] Parsed extracted JSON {key}={value}")
+                            return value
+                        except Exception:
+                            m = re.search(r"([-+]?[0-9]+(?:\.[0-9]+)?)", str(parsed_obj.get(key)))
+                            if m:
+                                value = float(m.group(1))
+                                print(f"[gemini] Parsed numeric token from extracted JSON {key}: {value}")
+                                return value
+            except Exception:
+                pass
+
+        # Key-specific regex fallback (text that is not valid JSON).
+        for key in ("fuel_rate_kg_hr", "fuel rate", "fuel_rate", "rate"):
+            m_key = re.search(
+                rf"{re.escape(key)}\s*[:=]\s*([-+]?[0-9]+(?:\.[0-9]+)?)",
+                raw_text,
+                flags=re.IGNORECASE,
+            )
+            if m_key:
+                value = float(m_key.group(1))
+                print(f"[gemini] Parsed key regex {key}={value}")
+                return value
+
+        # Final fallback: first numeric token from whole text.
+        m = re.search(r"([-+]?[0-9]+(?:\.[0-9]+)?)", raw_text)
         if not m:
+            print(f"[gemini] Could not parse fuel_rate_kg_hr from Gemini text: {raw_text[:200]}")
             return None
-        return float(m.group(1))
+        value = float(m.group(1))
+        print(f"[gemini] Parsed first numeric token={value}")
+        return value
+
+
+def _call_gemini_for_elapsed_hr(prompt: str) -> Optional[float]:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        print("[gemini-elapsed] GEMINI_API_KEY not set; skipping elapsed estimation.")
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 64,
+            "stopSequences": ["\n"],
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    req = urllib_request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[gemini-elapsed] request failed: {e}")
+        return None
+
+    try:
+        candidate0 = data["candidates"][0]
+        finish_reason = str(candidate0.get("finishReason", ""))
+        if finish_reason:
+            print(f"[gemini-elapsed] finishReason={finish_reason}")
+        parts = candidate0["content"]["parts"]
+        text = "\n".join([str(p.get("text") or "").strip() for p in parts if str(p.get("text") or "").strip()]).strip()
+    except Exception:
+        print(f"[gemini-elapsed] Unexpected response shape: {str(data)[:300]}")
+        return None
+
+    if not text:
+        print("[gemini-elapsed] Empty text response.")
+        return None
+
+    raw_text = str(text).strip()
+    print(f"[gemini-elapsed] Raw response text: {raw_text[:240]}")
+    for key in ("elapsed_hr", "elapsed_hours", "flight_time_hr", "hours", "time_hr"):
+        m_key = re.search(
+            rf"{re.escape(key)}\s*[:=]\s*([-+]?[0-9]+(?:\.[0-9]+)?)",
+            raw_text,
+            flags=re.IGNORECASE,
+        )
+        if m_key:
+            value = _safe_float(m_key.group(1), default=0.0)
+            if value > 0:
+                print(f"[gemini-elapsed] Parsed {key}={value}")
+                return value
+
+    m = re.search(r"([-+]?[0-9]+(?:\.[0-9]+)?)", raw_text)
+    if not m:
+        print(f"[gemini-elapsed] Could not parse elapsed_hr from text: {raw_text[:200]}")
+        return None
+    value = _safe_float(m.group(1), default=0.0)
+    if value <= 0:
+        return None
+    print(f"[gemini-elapsed] Parsed first numeric token={value}")
+    return value
+
+
+def _estimate_elapsed_from_gemini(route_text: Optional[str], cur_lat: Any, cur_lon: Any, gs_kt: Any, phase: Optional[str]) -> Optional[float]:
+    route = str(route_text or "").strip().upper()
+    # Use first segment as departure airport hint (e.g., BOS-CMH or CLT-CAK-CLT -> CLT)
+    dep = ""
+    m = re.match(r"^([A-Z]{3,4})-", route)
+    if m:
+        dep = m.group(1)
+
+    lat = _safe_float(cur_lat, default=float("nan"))
+    lon = _safe_float(cur_lon, default=float("nan"))
+    gs = _safe_float(gs_kt, default=0.0)
+    has_latlon = math.isfinite(lat) and math.isfinite(lon)
+    lat_text = f"{lat}" if has_latlon else "UNKNOWN"
+    lon_text = f"{lon}" if has_latlon else "UNKNOWN"
+    if not has_latlon:
+        print("[gemini-elapsed] Missing current lat/lon in snapshot; requesting estimate with partial inputs.")
+    if not route:
+        print("[gemini-elapsed] Missing route in snapshot; requesting estimate with partial inputs.")
+
+    prompt = (
+        "Estimate elapsed flight time in hours.\n"
+        f"dep={dep or 'UNKNOWN'} route={route or 'UNKNOWN'} "
+        f"lat={lat_text} lon={lon_text} gs_kt={gs if gs > 0 else 'UNKNOWN'} phase={phase or 'UNKNOWN'}\n"
+        "Output exactly one token in this format: elapsed_hr=<number>\n"
+        "No words. No JSON. No markdown. Example: elapsed_hr=2.35\n"
+    )
+    print(
+        f"[gemini-elapsed] Input dep={dep or 'UNKNOWN'} route={route or 'UNKNOWN'} "
+        f"lat={lat_text} lon={lon_text} gs_kt={gs:.1f} phase={phase or 'UNKNOWN'}"
+    )
+    hr = _call_gemini_for_elapsed_hr(prompt)
+    if hr is None:
+        return None
+    # Practical bounds for a single flight leg in this demo.
+    hr = _safe_float(hr, default=0.0)
+    if hr <= 0:
+        return None
+    return float(min(max(hr, 0.05), 18.0))
 
 
 def _heuristic_fuel_rate(phase: str, ground_speed_kt: Optional[float]) -> float:
@@ -308,24 +608,24 @@ def _estimate_fuel_rate(
     now = time.time()
     cached = fuel_rate_cache.get(cache_key)
     if cached and (now - cached["ts"]) <= FUEL_RATE_TTL_SEC:
-        return float(cached["rate"]), str(cached["source"])
+        cached_rate = _safe_float(cached.get("rate"), default=0.0)
+        if cached_rate > 0.0:
+            return cached_rate, str(cached.get("source", "cache"))
 
     info = _get_aircraft_info(icao_hex)
     prompt = (
-        "You are an aviation performance assistant. Return ONLY JSON.\n"
-        "Given the flight id/callsign and current phase, estimate the typical fuel burn rate in kg/hr.\n"
-        "If unsure, use a conservative typical value for a medium narrowbody jet.\n"
-        f"Flight ID: {flight_id or 'UNKNOWN'}\n"
-        f"Phase: {phase or 'UNKNOWN'}\n"
-        f"Aircraft typecode: {info.get('typecode', '')}\n"
-        f"Aircraft model: {info.get('model', '')}\n"
-        f"Manufacturer: {info.get('manufacturer', '')}\n"
-        f"Altitude ft: {altitude_ft if altitude_ft is not None else 'UNKNOWN'}\n"
-        f"Ground speed kt: {ground_speed_kt if ground_speed_kt is not None else 'UNKNOWN'}\n"
-        "Respond with JSON: {\"fuel_rate_kg_hr\": <number>}\n"
+        "Estimate aircraft fuel burn rate in kg/hr.\n"
+        f"flight_id={flight_id or 'UNKNOWN'} phase={phase or 'UNKNOWN'} "
+        f"typecode={info.get('typecode', '') or 'UNKNOWN'} model={info.get('model', '') or 'UNKNOWN'} "
+        f"alt_ft={altitude_ft if altitude_ft is not None else 'UNKNOWN'} "
+        f"gs_kt={ground_speed_kt if ground_speed_kt is not None else 'UNKNOWN'}\n"
+        "Output exactly one token in this format: fuel_rate_kg_hr=<number>\n"
+        "No words. No JSON. No markdown. Example: fuel_rate_kg_hr=2450\n"
     )
     rate = _call_gemini_for_fuel_rate(prompt)
     if rate is not None:
+        rate = _safe_float(rate, default=0.0)
+    if rate is not None and rate > 0.0:
         rate = float(max(50.0, min(rate, 20000.0)))
         fuel_rate_cache[cache_key] = {"rate": rate, "source": "gemini", "ts": now}
         return rate, "gemini"
@@ -340,9 +640,10 @@ def _estimate_fuel_rate(
                     alt=float(altitude_ft or 35000.0),
                 )
             )
-            rate = float(ff_kg_s * 3600.0)
-            fuel_rate_cache[cache_key] = {"rate": rate, "source": "openap", "ts": now}
-            return rate, "openap"
+            rate = _safe_float(ff_kg_s * 3600.0, default=0.0)
+            if rate > 0.0:
+                fuel_rate_cache[cache_key] = {"rate": rate, "source": "openap", "ts": now}
+                return rate, "openap"
         except Exception:
             pass
 
@@ -463,6 +764,15 @@ def _get_latest_snapshot(icao: str) -> Dict[str, Any]:
     cols = ["Altitude", "GroundSpeed", "VerticalRate", "Track", "Time_MSG_Generated"]
     if flight_col:
         cols.append(flight_col)
+    route_col = _route_column()
+    lat_col = _lat_column()
+    lon_col = _lon_column()
+    if route_col:
+        cols.append(route_col)
+    if lat_col:
+        cols.append(lat_col)
+    if lon_col:
+        cols.append(lon_col)
     query = f"""
         SELECT {", ".join(cols)}
         FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
@@ -479,42 +789,98 @@ def _get_latest_snapshot(icao: str) -> Dict[str, Any]:
     row = df.iloc[0].to_dict()
     if flight_col and flight_col in row:
         row["flight_id"] = row.get(flight_col)
+    if route_col and route_col in row:
+        row["route"] = row.get(route_col)
+    if lat_col and lat_col in row:
+        row["lat"] = row.get(lat_col)
+    if lon_col and lon_col in row:
+        row["lon"] = row.get(lon_col)
     return row
 
 
-def _get_flight_time_range(icao: str, flight_id: str, window_hr: int = 6) -> tuple[Optional[datetime], Optional[datetime]]:
+def _get_flight_time_range(icao: str, flight_id: str, window_hr: int = 6) -> tuple[Optional[Any], Optional[Any]]:
     if not bq_client:
         raise HTTPException(status_code=503, detail="BigQuery client not initialized")
-    if window_hr < 1:
-        window_hr = 1
-    if window_hr > 24:
-        window_hr = 24
     flight_col = _flight_id_column()
-    filters = ["HexIdent = @icao", f"Time_MSG_Generated >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {int(window_hr)} HOUR)"]
+    filters = ["HexIdent = @icao"]
     params = [bigquery.ScalarQueryParameter("icao", "STRING", icao)]
     if flight_col and flight_id:
         filters.append(f"{flight_col} = @flight_id")
         params.append(bigquery.ScalarQueryParameter("flight_id", "STRING", flight_id))
-    query = f"""
-        SELECT MIN(Time_MSG_Generated) AS start_time, MAX(Time_MSG_Generated) AS end_time
+    where_clause = " AND ".join(filters)
+    query_first = f"""
+        SELECT Time_MSG_Generated AS t
         FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
-        WHERE {" AND ".join(filters)}
+        WHERE {where_clause}
+        ORDER BY Time_MSG_Generated ASC
+        LIMIT 1
+    """
+    query_last = f"""
+        SELECT Time_MSG_Generated AS t
+        FROM `{PROJECT_ID}.{DATASET_ID}.{TABLE_ID}`
+        WHERE {where_clause}
+        ORDER BY Time_MSG_Generated DESC
+        LIMIT 1
     """
     job_config = bigquery.QueryJobConfig(query_parameters=params)
-    df = bq_client.query(query, job_config=job_config).to_dataframe()
-    if df.empty:
+    try:
+        df_first = bq_client.query(query_first, job_config=job_config).to_dataframe()
+        df_last = bq_client.query(query_last, job_config=job_config).to_dataframe()
+    except Exception:
         return None, None
-    start_time = df.iloc[0].get("start_time")
-    end_time = df.iloc[0].get("end_time")
-    if pd.isna(start_time) or pd.isna(end_time):
+
+    if df_first.empty or df_last.empty:
         return None, None
-    start_dt = start_time.to_pydatetime() if hasattr(start_time, "to_pydatetime") else start_time
-    end_dt = end_time.to_pydatetime() if hasattr(end_time, "to_pydatetime") else end_time
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=timezone.utc)
-    if end_dt.tzinfo is None:
-        end_dt = end_dt.replace(tzinfo=timezone.utc)
-    return start_dt, end_dt
+    return df_first.iloc[0].get("t"), df_last.iloc[0].get("t")
+
+
+def _coerce_snapshot_time_to_datetime(value: Any, now_utc: datetime) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
+
+    dt: Optional[datetime] = None
+    now_naive_utc = now_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, dt_time):
+        dt = datetime.combine(now_utc.date(), value)
+        # TIME columns can belong to the previous UTC day.
+        dt_cmp = dt if dt.tzinfo is None else dt.astimezone(timezone.utc).replace(tzinfo=None)
+        if dt_cmp > now_naive_utc + timedelta(minutes=1):
+            dt = dt - timedelta(days=1)
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except Exception:
+            try:
+                t = dt_time.fromisoformat(raw)
+                dt = datetime.combine(now_utc.date(), t)
+                dt_cmp = dt if dt.tzinfo is None else dt.astimezone(timezone.utc).replace(tzinfo=None)
+                if dt_cmp > now_naive_utc + timedelta(minutes=1):
+                    dt = dt - timedelta(days=1)
+            except Exception:
+                return None
+    else:
+        return None
+
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 
 @app.get("/predict/{icao}", response_model=PredictionResponse)
@@ -528,14 +894,14 @@ async def predict_phase(icao: str):
     # 1. Get Data Sequence
     try:
         df_final = _prepare_sequence(icao)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Preprocessing failed: {str(e)}")
+    except Exception:
+        return PredictionResponse(icao=icao, phase="Unknown", features=[])
 
     # 3. Predict
     try:
         prediction = _predict_phase_name(df_final)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+    except Exception:
+        return PredictionResponse(icao=icao, phase="Unknown", features=[])
 
     # Prepare features for response (convert to list of dicts)
     features_response = df_final.to_dict(orient='records')
@@ -548,17 +914,39 @@ async def predict_phase(icao: str):
 
 
 @app.get("/fuel/summary", response_model=FuelSummaryResponse)
-async def fuel_summary(icao: str, flight_id: Optional[str] = None, phase: Optional[str] = None, time_window_hr: int = 6):
+async def fuel_summary(
+    icao: str,
+    flight_id: Optional[str] = None,
+    phase: Optional[str] = None,
+    time_window_hr: int = 6,
+    route: Optional[str] = None,
+    current_lat: Optional[float] = None,
+    current_lon: Optional[float] = None,
+    gs_kt: Optional[float] = None,
+):
     if not bq_client:
         raise HTTPException(status_code=503, detail="BigQuery client not initialized")
-    icao = str(icao).strip()
-    if not icao:
+    icao = _normalize_icao(icao)
+    if _is_placeholder_icao(icao):
         raise HTTPException(status_code=400, detail="icao is required")
     flight_id_norm = _normalize_flight_id(flight_id)
 
     snapshot = _get_latest_snapshot(icao)
     alt = snapshot.get("Altitude")
     gs = snapshot.get("GroundSpeed")
+
+    # Prefer realtime frontend values when provided to avoid schema/column mismatch in BQ snapshot.
+    if current_lat is not None:
+        snapshot["lat"] = current_lat
+    if current_lon is not None:
+        snapshot["lon"] = current_lon
+    if route:
+        route_key = str(route).strip().upper()
+        if route_key and route_key not in {"N/A", "UNKNOWN", "LOADING"}:
+            snapshot["route"] = route_key
+    if gs_kt is not None:
+        gs = gs_kt
+
     if not flight_id_norm and snapshot.get("flight_id"):
         flight_id_norm = _normalize_flight_id(str(snapshot.get("flight_id")))
 
@@ -569,33 +957,91 @@ async def fuel_summary(icao: str, flight_id: Optional[str] = None, phase: Option
         except Exception:
             phase = "Unknown"
 
-    rate, source = _estimate_fuel_rate(
+    # Run expensive/blocking estimations concurrently to reduce frontend timeout risk.
+    fuel_task = asyncio.to_thread(
+        _estimate_fuel_rate,
         flight_id=flight_id_norm,
         phase=phase or "",
         icao_hex=icao,
         altitude_ft=float(alt) if alt is not None else None,
         ground_speed_kt=float(gs) if gs is not None else None,
     )
+    elapsed_gemini_task = asyncio.to_thread(
+        _estimate_elapsed_from_gemini,
+        route_text=snapshot.get("route"),
+        cur_lat=snapshot.get("lat"),
+        cur_lon=snapshot.get("lon"),
+        gs_kt=gs,
+        phase=phase,
+    )
+    time_range_task = asyncio.to_thread(_get_flight_time_range, icao, flight_id_norm, time_window_hr)
 
-    start_time, end_time = _get_flight_time_range(icao, flight_id_norm, window_hr=time_window_hr)
+    (rate, source), gemini_elapsed_hr, (start_raw, end_raw) = await asyncio.gather(
+        fuel_task, elapsed_gemini_task, time_range_task
+    )
+
+    now_utc = datetime.now(timezone.utc)
+    start_time = _coerce_snapshot_time_to_datetime(start_raw, now_utc)
+    end_time = _coerce_snapshot_time_to_datetime(end_raw, now_utc)
+
     if not end_time:
-        end_time = datetime.now(timezone.utc)
+        end_time = _coerce_snapshot_time_to_datetime(snapshot.get("Time_MSG_Generated"), now_utc) or now_utc
     if not start_time:
         start_time = end_time
+    if start_time > end_time:
+        start_time = end_time
 
-    elapsed_hr = max(0.0, (end_time - start_time).total_seconds() / 3600.0)
-    fuel_used = float(rate * elapsed_hr)
-    co2_kg = float(fuel_used * DEFAULT_CO2_KG_PER_KG_FUEL)
+    safe_rate = _safe_float(rate, default=0.0)
+    safe_elapsed_hr = _safe_float((end_time - start_time).total_seconds() / 3600.0, default=0.0)
+    elapsed_hr = max(0.0, safe_elapsed_hr)
+    elapsed_source = "observed"
+    estimated = False
+    route_elapsed_hr: Optional[float] = None
+
+    # If observed duration is missing/nearly-zero, use already-fetched Gemini estimate first.
+    if elapsed_hr < 0.03:  # < ~2 minutes
+        if gemini_elapsed_hr is not None and gemini_elapsed_hr > elapsed_hr:
+            elapsed_hr = gemini_elapsed_hr
+            elapsed_source = "estimated_gemini"
+            estimated = True
+
+    # Secondary fallback: route distance estimate.
+    if elapsed_hr < 0.03:
+        route_elapsed_hr = _estimate_elapsed_from_route(
+            route_text=snapshot.get("route"),
+            cur_lat=snapshot.get("lat"),
+            cur_lon=snapshot.get("lon"),
+            gs_kt=gs,
+        )
+        if route_elapsed_hr is not None and route_elapsed_hr > elapsed_hr:
+            elapsed_hr = route_elapsed_hr
+            elapsed_source = "estimated_route_distance"
+            estimated = True
+
+    print(
+        "[fuel_summary] "
+        f"icao={icao} flight_id={flight_id_norm or 'N/A'} route={snapshot.get('route') or 'N/A'} "
+        f"phase={phase or 'UNKNOWN'} rate={safe_rate:.1f}({source}) "
+        f"elapsed_observed_hr={safe_elapsed_hr:.3f} "
+        f"elapsed_gemini_hr={(f'{gemini_elapsed_hr:.3f}' if gemini_elapsed_hr is not None else 'None')} "
+        f"elapsed_route_hr={(f'{route_elapsed_hr:.3f}' if route_elapsed_hr is not None else 'None')} "
+        f"elapsed_final_hr={elapsed_hr:.3f} source={elapsed_source} estimated={estimated}"
+    )
+
+    fuel_used = _safe_float(safe_rate * elapsed_hr, default=0.0)
+    co2_kg = _safe_float(fuel_used * DEFAULT_CO2_KG_PER_KG_FUEL, default=0.0)
 
     return FuelSummaryResponse(
         icao=icao,
         flight_id=flight_id_norm or None,
         phase=phase,
-        fuel_rate_kg_hr=float(rate),
+        fuel_rate_kg_hr=safe_rate,
         fuel_used_kg=fuel_used,
         co2_kg=co2_kg,
         elapsed_hr=float(elapsed_hr),
         rate_source=source,
+        elapsed_source=elapsed_source,
+        estimated=estimated,
         updated_at=datetime.now(timezone.utc),
         start_time=start_time,
         end_time=end_time,
@@ -660,6 +1106,7 @@ async def weather_overlay_endpoint(req: WeatherOverlayRequest):
         # dependency missing
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
+        print(f"[weather_overlay] Open-Meteo fetch failed: {repr(e)}")
         raise HTTPException(status_code=502, detail=f"Open-Meteo fetch failed: {e}")
 
     # Build response
@@ -917,6 +1364,7 @@ async def co2_recommend_endpoint(req: CO2RecommendRequest):
                 seen.add(key)
                 all_pts.append(key)
 
+    wind_by_point: dict[tuple[float, float], tuple[float, float]] = {}
     try:
         loc_hourlies = open_meteo_client.fetch_hourly(
             latitudes=[p[0] for p in all_pts],
@@ -925,23 +1373,22 @@ async def co2_recommend_endpoint(req: CO2RecommendRequest):
             forecast_days=2,
             timezone_name="UTC",
         )
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Open-Meteo fetch failed: {e}")
 
-    # Map each unique point to (ws_kmh, wd_from_deg) at eval_time
-    wind_by_point: dict[tuple[float, float], tuple[float, float]] = {}
-    for (lat, lon), lh in zip(all_pts, loc_hourlies):
-        df = lh.hourly
-        idx = open_meteo_client.pick_time_index(df["time"], eval_time, mode="nearest")
-        try:
-            ws = float(df.loc[idx, wind_speed_var])
-            wd = float(df.loc[idx, wind_dir_var])
-        except Exception:
-            ws = 0.0
-            wd = 0.0
-        wind_by_point[(lat, lon)] = (ws, wd)
+        # Map each unique point to (ws_kmh, wd_from_deg) at eval_time
+        for (lat, lon), lh in zip(all_pts, loc_hourlies):
+            df = lh.hourly
+            idx = open_meteo_client.pick_time_index(df["time"], eval_time, mode="nearest")
+            try:
+                ws = _safe_float(df.loc[idx, wind_speed_var], default=0.0)
+                wd = _safe_float(df.loc[idx, wind_dir_var], default=0.0)
+            except Exception:
+                ws = 0.0
+                wd = 0.0
+            wind_by_point[(lat, lon)] = (ws, wd)
+    except Exception:
+        # Fallback for transient weather API failures: continue with no-wind assumption.
+        for lat, lon in all_pts:
+            wind_by_point[(lat, lon)] = (0.0, 0.0)
 
     # Fuel flow model (kg/s)
     try:

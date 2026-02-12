@@ -143,6 +143,34 @@ static std::vector<TRiskOverlayCell> g_RiskOverlayCells;
 static double g_RiskOverlayCellDeg = 0.01;
 static bool g_HaveRiskOverlay = false;
 
+// Backend circuit-breaker: avoid hammering localhost API when it is down/unreachable.
+static __int64 g_BackendBlockUntilMs = 0;
+static __int64 g_BackendBackoffMs = 3000;
+static const __int64 BACKEND_BACKOFF_MAX_MS = 60000;
+
+static bool BackendRequestsAllowed()
+{
+  return (GetCurrentTimeInMsec() >= g_BackendBlockUntilMs);
+}
+
+static void BackendRegisterFailure()
+{
+  __int64 now = GetCurrentTimeInMsec();
+  g_BackendBlockUntilMs = now + g_BackendBackoffMs;
+  if (g_BackendBackoffMs < BACKEND_BACKOFF_MAX_MS)
+  {
+    g_BackendBackoffMs *= 2;
+    if (g_BackendBackoffMs > BACKEND_BACKOFF_MAX_MS)
+      g_BackendBackoffMs = BACKEND_BACKOFF_MAX_MS;
+  }
+}
+
+static void BackendRegisterSuccess()
+{
+  g_BackendBlockUntilMs = 0;
+  g_BackendBackoffMs = 3000;
+}
+
 static float RiskToRed(double risk)
 {
   if (risk >= 80.0) return 1.0f;
@@ -310,6 +338,11 @@ void __fastcall TCO2RecommendThread::DoFetch(void)
 	TCO2RecommendRequest reqLocal;
 	if (!Form1->DequeueCO2Recommend(reqLocal)) return;
 	Req = reqLocal;
+	if (!BackendRequestsAllowed())
+	{
+		Form1->StoreCO2RecommendResult(Req, false, std::vector<TGeoPoint>(), 0.0, 0.0, 0.0);
+		return;
+	}
 
 	TFormatSettings fs = TFormatSettings::Create();
 	fs.DecimalSeparator = '.';
@@ -337,6 +370,8 @@ void __fastcall TCO2RecommendThread::DoFetch(void)
 	double co2ReductionKg = 0.0;
 
 	TNetHTTPClient *client = new TNetHTTPClient(NULL);
+	client->ConnectionTimeout = 3000;
+	client->ResponseTimeout = 10000;
 	TStringStream *body = NULL;
 	try
 	{
@@ -396,12 +431,18 @@ void __fastcall TCO2RecommendThread::DoFetch(void)
 
 				success = (points.size() >= 2);
 			}
+			BackendRegisterSuccess();
+		}
+		else
+		{
+			BackendRegisterFailure();
 		}
 	}
-	catch(...)
+	catch (const Exception &)
 	{
 		success = false;
 		points.clear();
+		BackendRegisterFailure();
 	}
 
 	if (body) delete body;
@@ -452,6 +493,8 @@ void __fastcall TRouteFetchThread::DoFetch(void)
 	bool haveDestination = false;
 
 	TNetHTTPClient *client = new TNetHTTPClient(NULL);
+	client->ConnectionTimeout = 3000;
+	client->ResponseTimeout = 10000;
 	try
 	{
 	  _di_IHTTPResponse response;
@@ -469,7 +512,7 @@ void __fastcall TRouteFetchThread::DoFetch(void)
 		}
 	  }
 	}
-	catch (...)
+	catch (const Exception &)
 	{
 	  success = false;
 	  routeText = "";
@@ -1061,6 +1104,7 @@ __fastcall TForm1::TForm1(TComponent* Owner)
 	LastFuelSummaryPostMs = 0;
 	LastFuelSummarySignature = "";
 	LastFuelSummaryPhase = "";
+	LastFuelSummaryRoute = "";
   TrackHook.Valid_CC=false;
   TrackHook.Valid_CPA=false;
   ClearTrajectoryState();
@@ -1106,12 +1150,18 @@ __fastcall TForm1::TForm1(TComponent* Owner)
  NetHTTPClientPrediction= new TNetHTTPClient(this);
  NetHTTPClientPrediction->OnRequestCompleted=NetHTTPClientPredictionRequestCompleted;
  NetHTTPClientPrediction->OnRequestError=NetHTTPClientPredictionRequestError;
+ NetHTTPClientPrediction->ConnectionTimeout = 3000;
+ NetHTTPClientPrediction->ResponseTimeout = 10000;
  NetHTTPClientWeather= new TNetHTTPClient(this);
  NetHTTPClientWeather->OnRequestCompleted=NetHTTPClientWeatherRequestCompleted;
  NetHTTPClientWeather->OnRequestError=NetHTTPClientWeatherRequestError;
+ NetHTTPClientWeather->ConnectionTimeout = 3000;
+ NetHTTPClientWeather->ResponseTimeout = 10000;
  NetHTTPClientFuel = new TNetHTTPClient(this);
  NetHTTPClientFuel->OnRequestCompleted = NetHTTPClientFuelRequestCompleted;
  NetHTTPClientFuel->OnRequestError = NetHTTPClientFuelRequestError;
+ NetHTTPClientFuel->ConnectionTimeout = 3000;
+ NetHTTPClientFuel->ResponseTimeout = 10000;
 
  PhaseLabel= new TLabel(Panel4);
  PhaseLabel->Parent=Panel4;
@@ -1606,9 +1656,8 @@ void __fastcall TForm1::DrawObjects(void)
 
 			  const AnsiString signature = BuildTrajectorySignature(TrajectoryState.Points);
 			  const __int64 nowMs = GetCurrentTimeInMsec();
-			  if (!signature.IsEmpty() &&
-				  (signature != LastWeatherOverlaySignature) &&
-				  ((LastWeatherOverlayPostMs == 0) || ((nowMs - LastWeatherOverlayPostMs) >= WEATHER_POST_THROTTLE_MS)))
+			  // Fetch weather only once per selected aircraft session.
+			  if (!signature.IsEmpty() && LastWeatherOverlaySignature.IsEmpty())
 			  {
 				SendPredictedRoutePointsToBackendFromPoints(TrajectoryState.Points);
 				LastWeatherOverlayPostMs = nowMs;
@@ -1628,19 +1677,8 @@ void __fastcall TForm1::DrawObjects(void)
 					FloatToStrF(sLat, ffFixed, 12, 2, fs) + "," + FloatToStrF(sLon, ffFixed, 12, 2, fs) + "->" +
 					FloatToStrF(eLat, ffFixed, 12, 2, fs) + "," + FloatToStrF(eLon, ffFixed, 12, 2, fs);
 
-				bool haveCo2ForSig = false;
-				CO2Cs->Acquire();
-				haveCo2ForSig = CO2OptimalState.Valid &&
-					(CO2OptimalState.ICAO == Data->ICAO) &&
-					(CO2OptimalState.Signature == co2Sig);
-				CO2Cs->Release();
-
-				const bool allowByThrottle = (LastCO2RecommendPostMs == 0) ||
-					((nowMs - LastCO2RecommendPostMs) >= CO2_RECOMMEND_THROTTLE_MS);
-				const bool signatureChanged = (co2Sig != LastCO2RecommendSignature);
-				const bool retrySameSignature = (!signatureChanged && !haveCo2ForSig);
-
-				if (!co2Sig.IsEmpty() && allowByThrottle && (signatureChanged || retrySameSignature))
+				// Fetch CO2 recommendation only once per selected aircraft session.
+				if (!co2Sig.IsEmpty() && LastCO2RecommendSignature.IsEmpty())
 				{
 					TCO2RecommendRequest req;
 					req.Signature = co2Sig;
@@ -1677,8 +1715,14 @@ void __fastcall TForm1::DrawObjects(void)
 			}
 			else
 			{
-				if (Co2Label && LastCO2RecommendSignature.IsEmpty())
-					Co2Label->Caption = "CO2 Saved: N/A";
+				if (Co2Label)
+				{
+					if (LastCO2RecommendSignature.IsEmpty())
+						Co2Label->Caption = "CO2 Saved: N/A";
+					else if ((LastCO2RecommendPostMs > 0) &&
+							 ((GetCurrentTimeInMsec() - LastCO2RecommendPostMs) > 15000))
+						Co2Label->Caption = "CO2 Saved: N/A";
+				}
 			}
 		  }
 		}
@@ -1949,6 +1993,7 @@ AnsiString __fastcall TForm1::BuildPredictedRoutePointsJsonFromPoints(const std:
 //---------------------------------------------------------------------------
 void __fastcall TForm1::SendPredictedRoutePointsToBackendFromPoints(const std::vector<TGeoPoint> &points)
 {
+ if (!BackendRequestsAllowed()) return;
  AnsiString payload = BuildPredictedRoutePointsJsonFromPoints(points);
  if (payload.IsEmpty()) return;
 
@@ -2020,7 +2065,7 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackendFromPoints(const std::v
 
   g_HaveRiskOverlay = !g_RiskOverlayCells.empty();
  }
- catch(...)
+ catch (const Exception &)
  {
    // Non-fatal: keep UI behavior unchanged if backend is unavailable.
  }
@@ -2059,41 +2104,80 @@ void __fastcall TForm1::SendPredictedRoutePointsToBackend(TADS_B_Aircraft *Data)
    SendPredictedRoutePointsToBackendFromPoints(fallbackPoints);
 }
 //---------------------------------------------------------------------------
-void __fastcall TForm1::RequestFuelSummary(const AnsiString &icaoHex, const AnsiString &flightId, const AnsiString &phase)
+void __fastcall TForm1::RequestFuelSummary(const AnsiString &icaoHex,
+										   const AnsiString &flightId,
+										   const AnsiString &phase,
+										   bool hasCurrentState,
+										   double currentLat,
+										   double currentLon,
+										   double currentGsKt,
+										   const AnsiString &routeText)
 {
  if (!NetHTTPClientFuel) return;
+ if (!BackendRequestsAllowed()) return;
  if (icaoHex.IsEmpty()) return;
 
+ AnsiString icaoKey = NormalizeCodeToken(icaoHex);
+ if (icaoKey.IsEmpty() || (icaoKey == "NA")) return;
+ if (icaoKey.Length() != 6) return;
+ for (int i = 1; i <= icaoKey.Length(); i++)
+ {
+   char c = icaoKey[i];
+   if ((c >= 'a') && (c <= 'f')) c = (char)(c - 'a' + 'A');
+   if (!(((c >= '0') && (c <= '9')) || ((c >= 'A') && (c <= 'F'))))
+	 return;
+ }
+
  AnsiString flightKey = NormalizeFlightNum(flightId);
- AnsiString signature = icaoHex + "|" + flightKey;
+ AnsiString routeKey = routeText.Trim().UpperCase();
+ const bool routeUsable = !routeKey.IsEmpty() && routeKey != "N/A" && routeKey != "UNKNOWN" && routeKey != "LOADING";
+
+ AnsiString signature = icaoKey + "|" + flightKey;
  __int64 nowMs = GetCurrentTimeInMsec();
  const bool allowByThrottle = (LastFuelSummaryPostMs == 0) ||
    ((nowMs - LastFuelSummaryPostMs) >= FUEL_SUMMARY_THROTTLE_MS);
  const bool signatureChanged = (signature != LastFuelSummarySignature);
  const bool phaseChanged = (!phase.IsEmpty() && (phase != LastFuelSummaryPhase));
+ const bool routeChanged = (routeUsable && (routeKey != LastFuelSummaryRoute));
 
- if (!signatureChanged && !phaseChanged && !allowByThrottle)
+ if (!signatureChanged && !phaseChanged && !routeChanged && !allowByThrottle)
    return;
 
  AnsiString url = FUEL_SUMMARY_URL;
- url += "?icao=" + icaoHex;
+ url += "?icao=" + icaoKey;
  if (!flightKey.IsEmpty())
    url += "&flight_id=" + flightKey;
  if (!phase.IsEmpty())
    url += "&phase=" + phase;
+
+ TFormatSettings fs = TFormatSettings::Create();
+ fs.DecimalSeparator = '.';
+ if (hasCurrentState)
+ {
+   url += "&current_lat=" + FloatToStrF(currentLat, ffFixed, 16, 6, fs);
+   url += "&current_lon=" + FloatToStrF(currentLon, ffFixed, 16, 6, fs);
+   if (currentGsKt > 0.0)
+	 url += "&gs_kt=" + FloatToStrF(currentGsKt, ffFixed, 16, 2, fs);
+ }
+ if (routeUsable)
+   url += "&route=" + routeKey;
 
  try {
    if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: Loading...";
    if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: Loading...";
    if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: Loading...";
    NetHTTPClientFuel->Get(url);
+   BackendRegisterSuccess();
    LastFuelSummaryPostMs = nowMs;
    LastFuelSummarySignature = signature;
    if (!phase.IsEmpty())
 	 LastFuelSummaryPhase = phase;
+   if (routeUsable)
+     LastFuelSummaryRoute = routeKey;
  }
- catch(...)
+ catch (const Exception &)
  {
+   BackendRegisterFailure();
    if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
    if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
    if (FuelCo2Label) FuelCo2Label->Caption = "CO2 emitted: N/A";
@@ -2158,13 +2242,19 @@ void __fastcall TForm1::RequestFuelSummary(const AnsiString &icaoHex, const Ansi
          
          // Call Prediction API
          try{
+           if (!BackendRequestsAllowed())
+           {
+             PhaseLabel->Caption="Phase: N/A";
+             return;
+           }
            AnsiString Url="http://localhost:8001/predict/"+(AnsiString)ADS_B_Aircraft->HexAddr;
            PhaseLabel->Caption="Phase: Loading...";
            NetHTTPClientPrediction->Get(Url);
-          RequestFuelSummary(ADS_B_Aircraft->HexAddr, ADS_B_Aircraft->FlightNum, "");
+           BackendRegisterSuccess();
          }
-         catch(...)
+         catch (const Exception &)
          {
+             BackendRegisterFailure();
              PhaseLabel->Caption="Phase: N/A";
             if (FuelRateLabel) FuelRateLabel->Caption = "Fuel rate: N/A";
             if (FuelUsedLabel) FuelUsedLabel->Caption = "Fuel used: N/A";
@@ -4036,9 +4126,43 @@ void __fastcall TForm1::NetHTTPClientPredictionRequestCompleted(TObject *Sender,
                 phase[i++] = *ptr++;
             }
             phase[i] = '\0';
-            
+
             PhaseLabel->Caption = "Phase: " + (AnsiString)phase;
-			RequestFuelSummary(ICAOLabel->Caption, FlightNumLabel->Caption, (AnsiString)phase);
+			AnsiString fuelIcao = NormalizeCodeToken(ICAOLabel->Caption);
+			if (fuelIcao.IsEmpty() && TrackHook.Valid_CC)
+			{
+				char hexBuf[16];
+				snprintf(hexBuf, sizeof(hexBuf), "%06X", (unsigned int)TrackHook.ICAO_CC);
+				fuelIcao = (AnsiString)hexBuf;
+			}
+			if (!fuelIcao.IsEmpty())
+			{
+				bool hasState = false;
+				double curLat = 0.0;
+				double curLon = 0.0;
+				double curGs = 0.0;
+				if (TrackHook.Valid_CC)
+				{
+					TADS_B_Aircraft *hookedData = (TADS_B_Aircraft *)ght_get(HashTable, sizeof(TrackHook.ICAO_CC), (void *)&TrackHook.ICAO_CC);
+					if (hookedData)
+					{
+						hasState = true;
+						curLat = hookedData->Latitude;
+						curLon = hookedData->Longitude;
+						curGs = hookedData->HaveSpeedAndHeading ? hookedData->Speed : 0.0;
+					}
+				}
+				RequestFuelSummary(
+					fuelIcao,
+					FlightNumLabel->Caption,
+					(AnsiString)phase,
+					hasState,
+					curLat,
+					curLon,
+					curGs,
+					RouteLabel ? RouteLabel->Caption : ""
+				);
+			}
         }
         else
         {

@@ -370,7 +370,14 @@ __published:	// IDE-managed Components
 									   double co2BestKg,
 									   double co2GeodesicKg,
 									   double co2ReductionKg);
-	void __fastcall RequestFuelSummary(const AnsiString &icaoHex, const AnsiString &flightId, const AnsiString &phase);
+	void __fastcall RequestFuelSummary(const AnsiString &icaoHex,
+									  const AnsiString &flightId,
+									  const AnsiString &phase,
+									  bool hasCurrentState = false,
+									  double currentLat = 0.0,
+									  double currentLon = 0.0,
+									  double currentGsKt = 0.0,
+									  const AnsiString &routeText = "");
 
 	public:		// User declarations
 	__fastcall TForm1(TComponent* Owner);
@@ -464,6 +471,7 @@ __published:	// IDE-managed Components
 	__int64                    LastFuelSummaryPostMs;
 	AnsiString                 LastFuelSummarySignature;
 	AnsiString                 LastFuelSummaryPhase;
+	AnsiString                 LastFuelSummaryRoute;
 	TForm                     *SpeechPopup;
 	TButton                   *SpeechToggleButton;
 	TLabel                    *SpeechPopupStatusLabel;
